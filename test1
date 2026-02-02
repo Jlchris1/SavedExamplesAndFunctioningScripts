@@ -48,7 +48,7 @@ local animSetA = {
 }
 
 local animSetB = {
-    idle = "rbxassetid://138930420450253",
+    idle = "rbxassetid://104495083302897",
     walk = "rbxassetid://107806791584829",
     jump = "rbxassetid://139390570947836"
 }

@@ -1,0 +1,46 @@
+Upon launching this script a dialogue appears below on the screen which gets typed out instead of instant: "Ï̷̺̓s̸̞̮͗̒ ̸̺̗͐̽í̶̡̒t̴̙́ ̸͙̆̕r̵͙̈͛͜e̵͖͕̓a̸̦͋͝l̶̢͓̋l̶̗͗y̴̛̯̼ ̷͎͕͒w̴̩͙̎̈o̵͕̎̈ṛ̵̨̈́̌t̸͚͉͂́h̴̛̫ ̶̺̞̿͝f̶̨̙͛î̸̭g̴̜̗̎h̶̞̜̓t̴̩̂ị̶̘́̉ṉ̶̾͠g̸̣͝?̶̺̽̀"
+
+A pause of 1 second before adding: "O̵̺͌r̸̻̈́ ̴̮̈́á̷̹r̷̺͒̆e̸̞͓̓̈ ̸̙͈̋̄ÿ̷̪o̵̧͈͗u̸̹͑ ̸̮͍̇r̸͚͊e̸̢̪͊a̶̻̓ḻ̴̽͑l̸̥̠̕y̶̦͉͒͗ ̴̛̳̲̄t̷̖̉̓h̷̠́a̶̩͕͝͝t̶̢̝̎ ̶̧̲̇d̷̖̱̉e̴̮̓̀s̷͕͑p̵̝̲͝è̸̻͕̿r̷̭͛a̶̳͍͋̕t̵̤̓ḙ̶͂̋ ̴͚̜̇͝t̵͎̑õ̵̖ ̵̲͒ͅl̴͎̓̚i̷̪̿v̷̡͓͝ȩ̴͝ ̴̗͖̇ä̴̭̱́̚ ̸̖̈́l̴̙̈͜ï̵͚̟f̸͓͑́e̵̲̙̒ ̵̨͕͋t̴̞̗̀h̵͓̥̓̈́a̴̼͂̌t̵͙͇̆́ ̴̝͚́̐w̸̱̔ạ̷̟̓̍s̵̪̋̀ ̴͕̃̌d̸̼̔̌e̶̲̔͝s̸̼̹̈́ţ̵͔̚í̷̘̖ǹ̶͍͠e̶̤͋̀ḋ̴̢̝ ̶͙̽t̷͔̏͝o̴̧͎̾ ̴͍̔d̵̺͕̔ȋ̵̘̘̿e̵͔͚̊̍ ̶̜̒ì̴̫͌n̷̻̦̒̓ ̴̞̩̃̚t̶͎̟̔̆ḧ̴̥́͌ͅe̵̛͔ ̵̻͑͘é̶̗ǹ̷̡͍d̸̨͆̇ ̷̗́ặ̶̡ņ̴̓́ÿ̶͎̞́̓w̶͔͛a̴̠̣͆͗ý̵͎͝s̸̘̰̎.̵̨̔͝"
+
+
+Passive ability 1: The FallenPartsDestroyHeight is set to 0/0 (nan)
+
+Passive ability 2: it also has a black hole like in the Lord of The Void script.
+
+
+
+
+
+
+
+Ţ̸̛̛͎̹̻̬̪̻̭̩̠̦̗͚̰͇̬̰̣̣̖͉̺̣̺̥̲̯̩̗̦͎͈̳̪̪͗̉̅͗̅̋̋̓̊̈́͘͘͜͠͝H̷̨̖̙̦͒̋͌̎̾̉̄̆͐͐̎̏̐͊̔̄́̈́̍͆̇̋̃̅̍̒̊͗͆̒͌̓́̅͘̕͜͝͝͠ͅḘ̶̡̡͕͍̹̭̰̼̬̯̲͓͇̥̘̳̠̺̔̔̀́̏͑̓̋̄̌̅̇̈͊̎̋͆͜͝ ̴̮̙̹̱̟̮̲̗̤̭̠̗͓͍̤̯̯̱̬̱̫̟̰̼͖͓͖̭̹̲̹̜͇̠͇̱͇̟̖̹̔̅̃̀̇̑́͑̽̄͂͋̇̈̉̾̾̾̔̋͒̉̉̋̐̐̂̑̚͘͘͜͠ͅͅV̶̧̧̧̛͔͈̙͍͇̖̥̭̦̙̭̼͕̝̳̖̰̠͙͖̺̼͍̲̤̿̂͑̋̅̾͌̔̈́͌͌͑̃̒̒̐̆͐̾͂́̈́́́̊͌̌̂̽̈̒̓͗̀̚͘͜͠͠͝ͅͅͅͅǪ̷̡͕͍̫̦̻̩͍̯͗̎́̒̀̄̉̿̉͛͒́̓͛̎̇̿́́̉̂̍̋͌͗̃̐̃̐͂̄̈́̈́͆̚̕͠I̸̧̛̛̛̛̩͕͖͉̍͊̇̐̓̈́̈́̓̋̀͑̈͛̽͆͊͒͒͜͝͠D̸͇̯̅͒̆̔̎̃̎̔̅͒͆̌͂́̄̋̃̅̓́̿̓̍̒̀͒̒̋̆̀̎̅͛̈͂̈́̓̚̚͝͝͝͝͠
+
+
+
+
+
+
+
+
+
+Abilities:
+
+Erase. (tool name: Erase.) basicly a tool that when you click on a  NPC it will give the tool a handle and wait for 0.8 seconds before the NPC dies and then and gets teleported to vector 9e37, 9e37, 9e37 and 0.5 seconds after erasure it will destroy() the handle. There's also a toggle when you equip the tool named "True Erasure" (THE TOGGLE ONLY SHOWS UP WHEN THE TOOL IS EQUIPPED) and that toggle disables the kill and when clicking a NPC it will Cframe the NPC to 9e37, 9e37, 9e37 and when the NPC is there it will anchor the NPC (but only when the NPC reached that vector and when it has it will not even wait 0.3 seconds before anchoring it since then the logic is still reachable.) (Still has the handle logic btw).
+
+Passive toggle 1: (requires no tool) its at the top of the screen and its small but it's named "Forcefield" with ": On" or ": Off" based on what the status is. But when it's on a 20 by 20 invisible block gets created which is unanchored massless but attached to the it can't colide with the player but it colides with NPC's basicly a forcefield. (Use welds and stuff whatever to create a smooth forcefield.) If an NPC managed to intrude the forcefield they die instanly and get tped to 9e37, 9e37, 9e37.
+
+Passive toggle 2: the toggle is called "Presence" also on/off function and when it's on every NPC in a 20 stud radius will be killed and tped to 9e37, 9e37, 9e37.
+
+Passive toggle 3: "Fear" also has on/off feature. But now NPCs run away (use walkto and make 30% of the NPCs run to the opposite of the local player every 0.01 seconds and 70 just freeze in fear (walkspeed to 0.)
+
+Toggle 4: "Time Delation" also on/off feature. It basicly reduced the speed of every npc by 85% and their fall and jump is also slowed.
+
+Toggle 5 entirely at the top: "X." Or "O" pending on if it's hidden or not. Which will hide the 4 passive toggles but not the toggle itself. When clicking again the 4 passive toggles show up again.
+
+(Passive toggles are always on the screen and not attached to any of the tools. And they all are black with dark purple text [void themed])
+
+Ability 2 (tool name: Void.) basicly when you click on an NPC the FallenPartsDestroyHeight gets set to -500 and the NPC gets teleported 10 studs above the FallenPartsDestroyHeight with velocity 100 aplied downwards and if the NPC dies then the void goes back to 0/0 (nan) (also has handle creation and destroy() in it). The distance between the Void and NPC depends on how huge the NPC model is. If the model of the NPC is high and wide it will be teleported higher than 10 studs above FallenPartsDestroyHeight and have more than 100 velocity aplied downwards. But that depends on the size of the model in whole. (If the tool suddenly disappears out of backpack or get's destroyed it will be re-given automaticly and equipped automaticly) This tool also has a gui button which only shows up when you have the tool equipped named: "Void's Domain" which makes the player slowly float up about 15 studs high along with every NPC in range upon use using lift up logic things and stuff and every NPC in a 750 by 750 stud radius have their jump power set to 0 and their walk as well before getting teleported along with local player to a huge 800 by 800 black baseplate with walls about 600 studs tall high and a ceiling that's also 800 studs wide. (a box) the box will be created 80000, 80000, 80000 studs away from spawn. And the npcs will not be able to move. And the time becomes 2 am. If every npc dies the local player teleports back or when the domain button gets clicked again. The local player will float up again before returning and after 3 seconds of floating up the local player teleports back again and every NPC that was still alive dies instantly before teleport back. And the Void tool has also a second button which puts the void on -500 again and sends every NPC there is to the Void using cframe (also based on model size and stuff.)
+
+Then the 3rd tool: "The Void." If you click anywhere while holding this tool every NPC within a 100 by 100 radius within the click gets killed and tped to 9e37, 9e37, 9e37. And is also has a button named "Infinity" which will make the local player float up and every NPC gets slowly pulled in different speeds and when NPCs are 10 studs away from local player they die and their body is cframed to 9e37, 9e37, 9e37. And it also has a toggle which is also called "True Erasure" and when its active the click cframes the NPCs to 9e37, 9e37, 9e37 without killing them and anchors them when they are at that spot. Then a second button named "Void's Judgement" which uses the black hole's parts and divides the black holes into the amount of black holes as there are players and the black holes will target every player in the server until they all died then if a player died the black hole with switch target and when they all die the black holes return back to local player.
+
+And that's it

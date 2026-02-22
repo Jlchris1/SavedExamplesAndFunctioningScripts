@@ -1,0 +1,714 @@
+-- RealityShift_VoidSystem.lua
+-- Server script. Put into ServerScriptService.
+-- Creates tool, builds replica (excludes NPCs/players), teleports replica to OFFSET.
+-- Implements: enter/exit behavior with NPC float-teleport-from-height, pitch-black infection,
+-- 95% slow for NPCs, terrain copy, and "Void Flood" (GUI button -> RemoteEvent) which spawns rising flood
+-- that drains NPC HP (10% max HP every 3s) while they are below the flood surface.
+
+local Players = game:GetService("Players")
+local StarterPack = game:GetService("StarterPack")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local RunService = game:GetService("RunService")
+
+local TOOL_NAME = "RealityShift"
+local OFFSET = Vector3.new(50000, 50000, 50000)
+local NPC_TELEPORT_RADIUS = 750
+local TERRAIN_PADDING = 32
+
+-- Flood config
+local FLOOD_SIZE = Vector3.new(2048, 2, 2048)
+local FLOOD_RISE_SPEED = 5 -- studs per second
+local FLOOD_DAMAGE_PERCENT = 0.10 -- 10% of max HP
+local FLOOD_DAMAGE_INTERVAL = 3 -- seconds
+
+-- Float/entry config (timings)
+local ENTRY_FLOAT_TIME = 1.2     -- seconds for initial lift
+local ENTRY_FLOAT_HEIGHT = 30    -- studs lifted during float before teleport
+local TELEPORT_FALL_HEIGHT = 120 -- the Y offset above destination they'll be teleported to (so they "fall down")
+local NPC_SLOW_FACTOR = 0.05     -- NPC new speed = original * NPC_SLOW_FACTOR (95% slower)
+
+-- Ensure RemoteEvent for GUI flood toggles
+local REMOTE_NAME = "RealityShift_Remote"
+local floodRemote = ReplicatedStorage:FindFirstChild(REMOTE_NAME)
+if not floodRemote then
+    floodRemote = Instance.new("RemoteEvent")
+    floodRemote.Name = REMOTE_NAME
+    floodRemote.Parent = ReplicatedStorage
+end
+
+-- Helper utilities
+local function isPlayerCharacter(model)
+    if not model or not model:IsA("Model") then return false end
+    return Players:GetPlayerFromCharacter(model) ~= nil
+end
+
+local function isNPC(model)
+    if not model or not model:IsA("Model") then return false end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    return hum and not isPlayerCharacter(model)
+end
+
+local function getModelRootPart(model)
+    if not model then return nil end
+    return model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso") or model.PrimaryPart
+end
+
+-- Save lighting snapshot
+local function snapshotLighting()
+    local snap = {}
+    snap.ClockTime = Lighting.ClockTime
+    snap.Brightness = Lighting.Brightness
+    snap.ExposureCompensation = Lighting.ExposureCompensation
+    snap.Ambient = Lighting.Ambient
+    snap.OutdoorAmbient = Lighting.OutdoorAmbient
+    snap.FogStart = Lighting.FogStart
+    snap.FogEnd = Lighting.FogEnd
+    snap.GlobalShadows = Lighting.GlobalShadows
+    snap.Sky = Lighting:FindFirstChildOfClass("Sky")
+    if snap.Sky then snap.SkyClone = snap.Sky:Clone() end
+    return snap
+end
+
+local function restoreLighting(snap)
+    if not snap then return end
+    pcall(function() Lighting.ClockTime = snap.ClockTime end)
+    pcall(function() Lighting.Brightness = snap.Brightness end)
+    pcall(function() Lighting.ExposureCompensation = snap.ExposureCompensation end)
+    pcall(function() Lighting.Ambient = snap.Ambient end)
+    pcall(function() Lighting.OutdoorAmbient = snap.OutdoorAmbient end)
+    pcall(function() Lighting.FogStart = snap.FogStart end)
+    pcall(function() Lighting.FogEnd = snap.FogEnd end)
+    pcall(function() Lighting.GlobalShadows = snap.GlobalShadows end)
+    if snap.SkyClone then
+        for _,v in ipairs(Lighting:GetChildren()) do if v:IsA("Sky") then v:Destroy() end end
+        snap.SkyClone.Parent = Lighting
+    end
+end
+
+local function setPitchBlack2AM()
+    pcall(function() Lighting.ClockTime = 2 end)
+    pcall(function() Lighting.Brightness = 0 end)
+    pcall(function() Lighting.ExposureCompensation = 0 end)
+    pcall(function() Lighting.Ambient = Color3.new(0,0,0) end)
+    pcall(function() Lighting.OutdoorAmbient = Color3.new(0,0,0) end)
+    pcall(function() Lighting.FogStart = 0 end)
+    pcall(function() Lighting.FogEnd = 100 end)
+    pcall(function() Lighting.GlobalShadows = true end)
+end
+
+-- Copy safe part children (meshes, decals, attachments)
+local function copySafeChildren(src, dest)
+    for _,child in ipairs(src:GetChildren()) do
+        local cls = child.ClassName
+        if cls == "SpecialMesh" or cls == "BlockMesh" or cls == "CylinderMesh" or cls == "Mesh" then
+            child:Clone().Parent = dest
+        elseif cls == "Decal" or cls == "Texture" or cls == "Attachment" or cls == "SurfaceGui" or cls == "ParticleEmitter" then
+            child:Clone().Parent = dest
+        end
+    end
+end
+
+-- Build replica model (exclude player characters and NPC models)
+local function buildReplicaModel()
+    local replica = Instance.new("Model")
+    replica.Name = "RealityReplica"
+    replica.Parent = Workspace
+
+    local minP, maxP
+
+    -- prepare skip set: player characters + NPC models
+    local skipRoots = {}
+    for _,pl in ipairs(Players:GetPlayers()) do if pl.Character then skipRoots[pl.Character] = true end end
+    for _,child in ipairs(Workspace:GetChildren()) do
+        if child:IsA("Model") then
+            local hum = child:FindFirstChildOfClass("Humanoid")
+            if hum and not isPlayerCharacter(child) then skipRoots[child] = true end
+        end
+    end
+
+    for _,desc in ipairs(Workspace:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            local skip = false
+            for root,_ in pairs(skipRoots) do
+                if desc:IsDescendantOf(root) then skip = true; break end
+            end
+            if not skip then
+                local copy
+                if desc.ClassName == "MeshPart" then copy = Instance.new("MeshPart") else copy = Instance.new("Part") end
+                copy.Parent = replica
+                pcall(function()
+                    copy.Name = desc.Name
+                    copy.Size = desc.Size
+                    copy.CFrame = desc.CFrame
+                    copy.Anchored = true
+                    copy.CanCollide = desc.CanCollide
+                    copy.Transparency = desc.Transparency
+                    copy.Material = desc.Material
+                    copy.Color = desc.Color
+                    copy.CastShadow = desc.CastShadow
+                end)
+                copySafeChildren(desc, copy)
+
+                -- update bounding
+                local pMin = desc.Position - desc.Size * 0.5
+                local pMax = desc.Position + desc.Size * 0.5
+                if not minP then minP = pMin; maxP = pMax
+                else
+                    minP = Vector3.new(math.min(minP.X,pMin.X), math.min(minP.Y,pMin.Y), math.min(minP.Z,pMin.Z))
+                    maxP = Vector3.new(math.max(maxP.X,pMax.X), math.max(maxP.Y,pMax.Y), math.max(maxP.Z,pMax.Z))
+                end
+            end
+        end
+    end
+
+    return replica, minP, maxP
+end
+
+-- Terrain helpers (convert world coords -> voxels)
+local function worldToVoxel(v)
+    return Vector3int16.new(math.floor(v.X / 4), math.floor(v.Y / 4), math.floor(v.Z / 4))
+end
+
+local function copyTerrainRegion(minP, maxP)
+    local terrain = Workspace:FindFirstChildOfClass("Terrain")
+    if not terrain or not minP or not maxP then return nil end
+    minP = minP - Vector3.new(TERRAIN_PADDING, TERRAIN_PADDING, TERRAIN_PADDING)
+    maxP = maxP + Vector3.new(TERRAIN_PADDING, TERRAIN_PADDING, TERRAIN_PADDING)
+    local minV = worldToVoxel(minP)
+    local maxV = worldToVoxel(maxP)
+    -- ensure min<=max
+    local minX, minY, minZ = math.min(minV.X,maxV.X), math.min(minV.Y,maxV.Y), math.min(minV.Z,maxV.Z)
+    local maxX, maxY, maxZ = math.max(minV.X,maxV.X), math.max(minV.Y,maxV.Y), math.max(minV.Z,maxV.Z)
+    local r3i = Region3int16.new(Vector3int16.new(minX,minY,minZ), Vector3int16.new(maxX,maxY,maxZ))
+    local ok, region = pcall(function() return terrain:CopyRegion(r3i) end)
+    if ok and region then
+        region.Parent = ServerStorage
+        return region, r3i
+    end
+    return nil
+end
+
+local function pasteTerrainRegion(region, worldCenter)
+    local terrain = Workspace:FindFirstChildOfClass("Terrain")
+    if not terrain or not region or not worldCenter then return false end
+    local ok = pcall(function() terrain:PasteRegion(region, worldCenter) end)
+    return ok
+end
+
+-- Helper: teleport model's parts by offset
+local function offsetModelParts(model, offset)
+    for _,part in ipairs(model:GetDescendants()) do
+        if part:IsA("BasePart") then
+            pcall(function() part.CFrame = part.CFrame + offset end)
+        end
+    end
+end
+
+-- Build replica immediately on server start and paste terrain if possible
+local REPLICA, TERR_REGION, REPL_MIN, REPL_MAX
+do
+    local built, minP, maxP = buildReplicaModel()
+    if built then
+        REPLICA = built
+        offsetModelParts(REPLICA, OFFSET)
+    end
+    if minP and maxP then
+        local region, r3i = copyTerrainRegion(minP, maxP)
+        if region then
+            TERR_REGION = region
+            local center = (minP + maxP) * 0.5 + OFFSET
+            if pasteTerrainRegion(TERR_REGION, center) then
+                print("RealityShift: pasted terrain to replica offset.")
+            else
+                warn("RealityShift: pasteTerrainRegion failed.")
+            end
+        end
+    end
+end
+
+-- Player state tracking
+local playerState = {} -- player -> state table
+
+-- NPC record management (save original visuals/locs/speeds so exit can restore)
+local function recordNPCState(model)
+    if not model then return nil end
+    local rec = {}
+    rec.model = model
+    rec.hum = model:FindFirstChildOfClass("Humanoid")
+    rec.root = getModelRootPart(model)
+    rec.parts = {}
+    -- save each basepart's color/material/decals
+    for _,p in ipairs(model:GetDescendants()) do
+        if p:IsA("BasePart") then
+            rec.parts[p] = {
+                Color = p.Color,
+                Material = p.Material,
+                Transparency = p.Transparency,
+                SurfaceAppearance = p:FindFirstChildOfClass("SurfaceAppearance") and p:FindFirstChildOfClass("SurfaceAppearance"):Clone()
+            }
+        end
+    end
+    -- save humanoid movement params
+    if rec.hum then
+        rec.origWalk = rec.hum.WalkSpeed
+        rec.origJump = rec.hum.JumpPower
+        rec.origPlatform = rec.hum.PlatformStand
+    end
+    -- save original root CFrame
+    if rec.root then rec.origRootCFrame = rec.root.CFrame end
+    return rec
+end
+
+local function restoreNPCState(rec)
+    if not rec or not rec.model then return end
+    local model = rec.model
+    -- restore parts
+    for part, data in pairs(rec.parts or {}) do
+        if part and part.Parent then
+            pcall(function()
+                if data.Color then part.Color = data.Color end
+                if data.Material then part.Material = data.Material end
+                if data.Transparency then part.Transparency = data.Transparency end
+                -- restore SurfaceAppearance if saved (replace existing)
+                local curSA = part:FindFirstChildOfClass("SurfaceAppearance")
+                if curSA then curSA:Destroy() end
+                if data.SurfaceAppearance then
+                    local clone = data.SurfaceAppearance:Clone()
+                    clone.Parent = part
+                end
+            end)
+        end
+    end
+    -- restore humanoid
+    if rec.hum then
+        pcall(function()
+            if rec.origWalk then rec.hum.WalkSpeed = rec.origWalk end
+            if rec.origJump and rec.hum.JumpPower ~= nil then rec.hum.JumpPower = rec.origJump end
+            rec.hum.PlatformStand = rec.origPlatform or false
+        end)
+    end
+    -- restore location
+    if rec.root and rec.root.Parent and rec.origRootCFrame then
+        for _,part in ipairs(model:GetDescendants()) do
+            if part:IsA("BasePart") then
+                pcall(function() part.CFrame = part.CFrame + (rec.origRootCFrame.p - rec.root.CFrame.p) end)
+            end
+        end
+    end
+end
+
+-- Float NPC up smoothly (server-side) over ENTRY_FLOAT_TIME and distance ENTRY_FLOAT_HEIGHT
+local function floatNPCUp(rec)
+    if not rec or not rec.root or not rec.root.Parent then return end
+    local dur = ENTRY_FLOAT_TIME
+    local t0 = tick()
+    local parts = {}
+    for _,p in ipairs(rec.model:GetDescendants()) do if p:IsA("BasePart") then table.insert(parts, p) end end
+    while tick() - t0 < dur do
+        local alpha = math.min(1, (tick() - t0) / dur)
+        local offsetY = ENTRY_FLOAT_HEIGHT * alpha
+        for _,p in ipairs(parts) do
+            if p and p.Parent then
+                pcall(function()
+                    local base = rec.origRootCFrame and rec.origRootCFrame.p or rec.root.Position
+                    local target = CFrame.new(p.Position + Vector3.new(0, offsetY, 0))
+                    p.CFrame = target
+                    -- zero velocities if present
+                    if p.AssemblyLinearVelocity then p.AssemblyLinearVelocity = Vector3.new(0,0,0) end
+                    if p.AssemblyAngularVelocity then p.AssemblyAngularVelocity = Vector3.new(0,0,0) end
+                end)
+            end
+        end
+        RunService.Heartbeat:Wait()
+    end
+end
+
+-- Teleport NPC to replica area from high Y so they fall down
+local function teleportNPCToReplica(rec, replicaCenter)
+    if not rec or not rec.root or not rec.root.Parent then return end
+    local model = rec.model
+    local rootPos = rec.root.Position
+    local localOffset = rootPos - (rec.origRootCFrame and rec.origRootCFrame.p or rootPos)
+    -- destination base position inside replica (relative center)
+    local destBasePos = replicaCenter + localOffset
+    -- teleport NPC parts to destBasePos + TELEPORT_FALL_HEIGHT (so they fall down)
+    local topPos = destBasePos + Vector3.new(0, TELEPORT_FALL_HEIGHT, 0)
+    for _,p in ipairs(model:GetDescendants()) do
+        if p:IsA("BasePart") then
+            pcall(function() p.CFrame = CFrame.new(topPos + (p.Position - rootPos)) end)
+        end
+    end
+end
+
+-- Apply infection visuals + slow to NPC
+local function infectNPC(rec)
+    if not rec or not rec.model then return end
+    for _,p in ipairs(rec.model:GetDescendants()) do
+        if p:IsA("BasePart") then
+            pcall(function()
+                p.Color = Color3.new(0,0,0)
+                p.Material = Enum.Material.SmoothPlastic
+            end)
+        end
+    end
+    if rec.hum then
+        pcall(function()
+            if rec.origWalk then rec.hum.WalkSpeed = math.max(0.1, rec.origWalk * NPC_SLOW_FACTOR) end
+            if rec.origJump and rec.hum.JumpPower ~= nil then rec.hum.JumpPower = math.max(0, (rec.origJump or 0) * NPC_SLOW_FACTOR) end
+        end)
+    end
+end
+
+-- ======================================================
+-- Tool creation + distribution + server handler binding
+-- ======================================================
+
+local function createToolTemplate()
+    local existing = StarterPack:FindFirstChild(TOOL_NAME)
+    if existing then existing:Destroy() end
+    local tool = Instance.new("Tool")
+    tool.Name = TOOL_NAME
+    tool.RequiresHandle = false
+    tool.CanBeDropped = false
+    -- add a LocalScript for GUI (client) inside the template so the GUI is created on equip
+    local localScript = Instance.new("LocalScript")
+    localScript.Name = "RealityShift_LocalGUI"
+    -- LocalScript source (creates small GUI with "Void Flood" and toggles flood via RemoteEvent)
+    localScript.Source = [[
+        local Players = game:GetService("Players")
+        local ReplicatedStorage = game:GetService("ReplicatedStorage")
+        local player = Players.LocalPlayer
+        local REMOTE_NAME = "]] .. REMOTE_NAME .. [["
+        local remote = ReplicatedStorage:WaitForChild(REMOTE_NAME)
+        local TOOL_NAME = "]] .. TOOL_NAME .. [["
+
+        local gui
+        local function ensureGUI()
+            local playerGui = player:WaitForChild("PlayerGui")
+            if playerGui:FindFirstChild("RealityShift_GUI") then
+                gui = playerGui:FindFirstChild("RealityShift_GUI")
+                gui.Enabled = true
+                return gui
+            end
+            local sg = Instance.new("ScreenGui")
+            sg.Name = "RealityShift_GUI"
+            sg.ResetOnSpawn = false
+            sg.Parent = playerGui
+
+            local frame = Instance.new("Frame", sg)
+            frame.Name = "Frame"
+            frame.Size = UDim2.new(0,220,0,40)
+            frame.Position = UDim2.new(0.5, -110, 0, 8)
+            frame.BackgroundTransparency = 0.3
+            frame.BackgroundColor3 = Color3.fromRGB(20,20,20)
+            frame.BorderSizePixel = 0
+
+            local btn = Instance.new("TextButton", frame)
+            btn.Name = "VoidFloodBtn"
+            btn.Size = UDim2.new(0,200,0,28)
+            btn.Position = UDim2.new(0,10,0,6)
+            btn.Font = Enum.Font.SourceSansBold
+            btn.TextSize = 16
+            btn.TextColor3 = Color3.new(1,1,1)
+            btn.Text = "Void Flood"
+            btn.AutoButtonColor = true
+
+            return sg
+        end
+
+        local function onEquipped()
+            local sg = ensureGUI()
+            sg.Enabled = true
+            local btn = sg.Frame:FindFirstChild("VoidFloodBtn")
+            if btn then
+                btn.MouseButton1Click:Connect(function()
+                    -- toggle flood request to server
+                    remote:FireServer("toggleFlood")
+                end)
+            end
+        end
+
+        local function onUnequipped()
+            local playerGui = player:FindFirstChildOfClass("PlayerGui")
+            if playerGui then
+                local sg = playerGui:FindFirstChild("RealityShift_GUI")
+                if sg then sg.Enabled = false end
+            end
+        end
+
+        script.Parent.Equipped:Connect(onEquipped)
+        script.Parent.Unequipped:Connect(onUnequipped)
+    ]]
+    localScript.Parent = tool
+
+    tool.Parent = StarterPack
+    return tool
+end
+
+-- Attach server-side handler to a tool instance in a player's backpack/character
+local function attachHandlerToToolInstance(toolInstance, player)
+    if not toolInstance or not player then return end
+    if toolInstance:GetAttribute("RealityShiftBound") then return end
+    toolInstance:SetAttribute("RealityShiftBound", true)
+
+    -- ensure player state
+    playerState[player] = playerState[player] or {
+        inReality = false,
+        playerOriginalCFrame = nil,
+        playerLightingSnapshot = nil,
+        npcRecords = {}, -- array of rec tables
+        floodActive = false,
+        floodPart = nil
+    }
+
+    toolInstance.Activated:Connect(function()
+        -- toggle enter/exit for this player
+        if not player.Character then return end
+        local hrp = getModelRootPart(player.Character)
+        if not hrp then return end
+        local state = playerState[player]
+
+        if not state.inReality then
+            -- ENTER: snapshot lighting, teleport nearby NPCs with float -> teleport from height, infect NPCs, teleport player to replica
+            state.playerLightingSnapshot = snapshotLighting()
+            setPitchBlack2AM()
+
+            -- save player original cframe
+            state.playerOriginalCFrame = hrp.CFrame
+
+            -- collect nearby NPCs
+            local npcList = {}
+            for _,desc in ipairs(Workspace:GetDescendants()) do
+                if desc:IsA("Humanoid") then
+                    local model = desc.Parent
+                    if model and isNPC(model) then
+                        local r = getModelRootPart(model)
+                        if r and (r.Position - hrp.Position).Magnitude <= NPC_TELEPORT_RADIUS then
+                            table.insert(npcList, model)
+                        end
+                    end
+                end
+            end
+
+            -- record NPC states, float them up then teleport to replica center (simultaneous)
+            local npcRecs = {}
+            local replicaCenter = (REPL_MAX and REPL_MIN) and ((REPL_MIN + REPL_MAX) * 0.5 + OFFSET) or (hrp.Position + OFFSET)
+            for _,model in ipairs(npcList) do
+                local rec = recordNPCState(model)
+                if rec then
+                    npcRecs[model] = rec
+                end
+            end
+            state.npcRecords = npcRecs
+
+            -- lift each NPC (non-blocking), then teleport them to replica and infect
+            for model, rec in pairs(npcRecs) do
+                spawn(function()
+                    -- set platform stand true while floating to prevent ragdoll flings
+                    if rec.hum then pcall(function() rec.hum.PlatformStand = true end) end
+                    -- float up
+                    floatNPCUp(rec)
+                    -- teleport from height above replica center
+                    teleportNPCToReplica(rec, replicaCenter)
+                    -- ensure they are not PlatformStand so gravity makes them fall
+                    if rec.hum then pcall(function() rec.hum.PlatformStand = false end) end
+                    -- infect visuals & speed after teleportation
+                    infectNPC(rec)
+                end)
+            end
+
+            -- teleport player by adding OFFSET (instant)
+            pcall(function() hrp.CFrame = hrp.CFrame + OFFSET end)
+
+            state.inReality = true
+            print(("RealityShift: %s entered replica (NPCs moved: %d)"):format(player.Name, #npcList))
+        else
+            -- EXIT: restore player position, restore NPCs states, restore lighting
+            -- teleport player back
+            if state.playerOriginalCFrame then
+                pcall(function() hrp.CFrame = state.playerOriginalCFrame end)
+            else
+                pcall(function() hrp.CFrame = hrp.CFrame - OFFSET end)
+            end
+
+            -- restore NPCs: attempt to return them to their original recorded positions & visuals
+            for model, rec in pairs(state.npcRecords or {}) do
+                if rec then
+                    -- If humanoid still exists, restore saved state (position, colors, speeds)
+                    restoreNPCState(rec)
+                end
+            end
+            state.npcRecords = {}
+
+            -- restore lighting
+            if state.playerLightingSnapshot then
+                restoreLighting(state.playerLightingSnapshot)
+                state.playerLightingSnapshot = nil
+            end
+
+            state.inReality = false
+            state.playerOriginalCFrame = nil
+            print(("RealityShift: %s exited replica"):format(player.Name))
+        end
+    end)
+end
+
+-- Give tool to player (and attach handler)
+local function giveToolToPlayer(player, toolTemplate)
+    if not player then return end
+    local backpack = player:FindFirstChild("Backpack") or player:WaitForChild("Backpack")
+    -- avoid duplicates
+    local found
+    for _,child in ipairs(backpack:GetChildren()) do
+        if child:IsA("Tool") and child.Name == TOOL_NAME then found = child; break end
+    end
+    if not found then
+        local copy = toolTemplate:Clone()
+        -- remove internal local script copy's source? keep it so it runs on client
+        copy.Parent = backpack
+        found = copy
+    end
+    attachHandlerToToolInstance(found, player)
+    -- attach when moved to Character (equip)
+    player.CharacterAdded:Connect(function(char)
+        char.ChildAdded:Connect(function(child)
+            if child:IsA("Tool") and child.Name == TOOL_NAME then
+                attachHandlerToToolInstance(child, player)
+            end
+        end)
+        -- check existing
+        for _,child in ipairs(char:GetChildren()) do
+            if child:IsA("Tool") and child.Name == TOOL_NAME then attachHandlerToToolInstance(child, player) end
+        end
+    end)
+end
+
+-- Create & distribute Tool template
+local toolTemplate = createToolTemplate()
+for _,pl in ipairs(Players:GetPlayers()) do
+    spawn(function() giveToolToPlayer(pl, toolTemplate) end)
+end
+Players.PlayerAdded:Connect(function(player) spawn(function() giveToolToPlayer(player, toolTemplate) end) end)
+
+-- ======================================================
+-- Void Flood: server handles rising flood & NPC damage when remote fired
+-- ======================================================
+
+-- compute highest Y in workspace to know when to stop rising flood
+local function computeHighestY()
+    local maxY = -1e9
+    for _,desc in ipairs(Workspace:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            local topY = desc.Position.Y + desc.Size.Y * 0.5
+            if topY > maxY then maxY = topY end
+        end
+    end
+    -- include replica bounding if known
+    if REPL_MAX then
+        local repTop = REPL_MAX.Y
+        if repTop > maxY then maxY = repTop end
+    end
+    return maxY
+end
+
+-- Damage NPCs under flood surface by 10% max HP every FLOOD_DAMAGE_INTERVAL seconds
+local function damageNPCsUnderSurface(surfaceY)
+    for _,desc in ipairs(Workspace:GetDescendants()) do
+        if desc:IsA("Humanoid") then
+            local model = desc.Parent
+            if model and isNPC(model) and desc.Parent then
+                local hrp = getModelRootPart(model)
+                if hrp and hrp.Position.Y <= surfaceY then
+                    local hum = desc
+                    if hum and hum.Parent and hum.Health > 0 then
+                        local dmg = (hum.MaxHealth or 100) * FLOOD_DAMAGE_PERCENT
+                        pcall(function() hum:TakeDamage(dmg) end)
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Create flood part and start rising; returns the flood part. Runs until targetY reached or flood destroyed.
+local function startFlood()
+    local flood = Instance.new("Part")
+    flood.Name = "VoidFlood_Plane"
+    flood.Size = FLOOD_SIZE
+    flood.Anchored = true
+    flood.CanCollide = false
+    flood.Material = Enum.Material.SmoothPlastic
+    flood.Color = Color3.new(0,0,0)
+    flood.Transparency = 0.5
+    flood.TopSurface = Enum.SurfaceType.Smooth
+    flood.BottomSurface = Enum.SurfaceType.Smooth
+    flood.Parent = Workspace
+
+    -- initial Y: put below map by 50 studs (or at minY - 50)
+    local initialY = 0
+    local minY = 1e9
+    for _,p in ipairs(Workspace:GetDescendants()) do
+        if p:IsA("BasePart") then
+            local bottomY = p.Position.Y - p.Size.Y * 0.5
+            if bottomY < minY then minY = bottomY end
+        end
+    end
+    if minY == 1e9 then minY = 0 end
+    initialY = minY - 50
+    flood.Position = Vector3.new(0, initialY, 0)
+
+    local highestY = computeHighestY()
+    local targetY = highestY + 50
+
+    -- damage timer
+    local lastDamageTick = tick()
+
+    -- rise loop
+    spawn(function()
+        while flood and flood.Parent do
+            local dt = RunService.Heartbeat:Wait()
+            local cur = flood.Position
+            local nextY = cur.Y + FLOOD_RISE_SPEED * dt
+            flood.Position = Vector3.new(cur.X, nextY, cur.Z)
+
+            -- every FLOOD_DAMAGE_INTERVAL seconds, damage NPCs under surface
+            if tick() - lastDamageTick >= FLOOD_DAMAGE_INTERVAL then
+                lastDamageTick = tick()
+                damageNPCsUnderSurface(flood.Position.Y)
+            end
+
+            if flood.Position.Y >= targetY then
+                print("RealityShift: Void Flood reached highest point; stopping rise.")
+                break
+            end
+        end
+    end)
+
+    return flood
+end
+
+-- RemoteEvent handler: toggle flood for the player (server runs a single shared flood visible to all)
+local currentFlood = nil
+local floodOwner = nil
+floodRemote.OnServerEvent:Connect(function(player, cmd)
+    if cmd == "toggleFlood" then
+        if currentFlood and currentFlood.Parent then
+            -- stop flood (destroy)
+            currentFlood:Destroy()
+            currentFlood = nil
+            floodOwner = nil
+            print(("RealityShift: %s stopped Void Flood"):format(player.Name))
+            return
+        end
+        -- only allow one flood at a time; create flood
+        local f = startFlood()
+        currentFlood = f
+        floodOwner = player
+        print(("RealityShift: %s started Void Flood"):format(player.Name))
+    end
+end)
+
+print("RealityShift server: loaded. Tool distributed. Replica created (if geometry present).")

@@ -214,4 +214,323 @@ end)
 
 print("[CloudSpawner] started")
 
+-- ServerScriptService.TornadoController.server
+local Config = require(game.ReplicatedStorage.Modules.Config)
+local TornadoClass = require(game.ReplicatedStorage.Modules.TornadoModule)
+local CloudManager = require(game.ReplicatedStorage.Modules.CloudManager)
+local RunService = game:GetService("RunService")
+
+-- start clouds first
+CloudManager.Start()
+
+-- helper to get clusters of clouds (very simple: pick n nearest clouds)
+local function findCloudCluster()
+    local blobs = workspace:GetTagged("WeatherCloudBlob")
+    if #blobs < Config.WallCloudClusterForTornado then return nil end
+    -- pick random blob as seed, find nearest ones
+    local seed = blobs[math.random(1,#blobs)]
+    table.sort(blobs, function(a,b)
+        return (a.Position - seed.Position).Magnitude < (b.Position - seed.Position).Magnitude
+    end)
+    local cluster = {}
+    for i=1, math.min(#blobs, Config.WallCloudClusterForTornado + math.random(0,3)) do
+        table.insert(cluster, blobs[i])
+    end
+    return cluster
+end
+
+-- attempt to form tornado from cloud cluster
+local function attemptFormation()
+    local cluster = findCloudCluster()
+    if not cluster then return end
+    if math.random() > Config.FormationSuccessChance then
+        -- formation failed (rare)
+        return
+    end
+
+    -- pick formation point roughly under cluster center (project down to nearest part)
+    local center = Vector3.new(0,0,0)
+    for _,c in ipairs(cluster) do center = center + c.Position end
+    center = center / #cluster
+
+    -- find ground (raycast down)
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = {}
+    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+    local ray = workspace:Raycast(center, Vector3.new(0, -500, 0), rayParams)
+    if not ray then return end
+    local groundPos = ray.Position
+    if groundPos.Y < Config.MinSpawnY then return end
+
+    -- choose tornado properties
+    local radius = math.random(Config.TornadoMinRadius, Config.TornadoMaxRadius)
+    local wind = math.floor(math.exp(math.random() * math.log(Config.TornadoMaxWindspeed))) -- bias to rarer big ones (example)
+    local tornado = TornadoClass.new(Vector3.new(center.X, groundPos.Y + 5, center.Z), radius, wind)
+    tornado.Lifespan = math.random(Config.TornadoTypicalLifespan - 120, Config.TornadoTypicalLifespan + 180)
+    tornado:start()
+end
+
+-- spawn loop (spawns tornado every 5-10 mins randomly)
+spawn(function()
+    while true do
+        local waitTime = math.random(Config.TornadoMinSpawnInterval, Config.TornadoMaxSpawnInterval)
+        wait(waitTime)
+        -- sometimes spawn multiple or none; simple: attempt one formation
+        attemptFormation()
+    end
+end)
+
+-- ReplicatedStorage.Modules.TornadoModule
+local Tornado = {}
+Tornado.__index = Tornado
+
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+local Config = require(game.ReplicatedStorage.Modules.Config)
+local TweenService = game:GetService("TweenService")
+
+-- helper: compute mass of a model (approx)
+local function computeModelMass(model)
+    local mass = 0
+    for _, p in ipairs(model:GetDescendants()) do
+        if p:IsA("BasePart") then
+            mass = mass + (p:GetMass or (p:GetMass and p:GetMass())) -- GetMass API may vary; use p:GetMass()
+            -- fallback: approximate by density*volume (not implemented here)
+        end
+    end
+    return mass
+end
+
+-- create visual funnel (stack of anchored parts with emitters) - simplified
+local function createFunnelVisual(position, height, radius, windseed)
+    local container = Instance.new("Model")
+    container.Name = "TornadoVisual"
+    container.Parent = workspace
+    local layers = math.clamp(math.floor(height/5), 6, 60)
+    for i = 1, layers do
+        local t = Instance.new("Part")
+        t.Anchored = true
+        t.CanCollide = false
+        t.Size = Vector3.new(radius * (1 - (i/layers) * 0.8), 1, radius * (1 - (i/layers) * 0.8))
+        local y = position.Y + (height * (i / layers))
+        t.CFrame = CFrame.new(position.X, y, position.Z) * CFrame.Angles(0, math.rad(i*10 + windseed), 0)
+        t.Transparency = 1
+        t.Parent = container
+
+        local emitter = Instance.new("ParticleEmitter")
+        emitter.Texture = Config.SmokeTexture
+        emitter.Lifetime = NumberRange.new(1.8, 4.2)
+        emitter.Rate = 60
+        emitter.Speed = NumberRange.new(0.2, 4)
+        emitter.Size = NumberSequence.new{NumberSequenceKeypoint.new(0, 0.2 + (i/layers)*2), NumberSequenceKeypoint.new(1, 0.2)}
+        emitter.RotSpeed = NumberRange.new(-60, 60)
+        emitter.Parent = t
+    end
+    return container
+end
+
+function Tornado.new(originPos, initialRadius, initialWindspeed)
+    local self = setmetatable({}, Tornado)
+    self.Origin = originPos or Vector3.new(0,50,0)
+    self.Radius = initialRadius or math.random(Config.TornadoMinRadius, Config.TornadoMaxRadius)
+    self.WindSpeed = initialWindspeed or math.random(Config.TornadoMinWindspeed, Config.TornadoMaxWindspeed)
+    self.State = "forming"
+    self.Age = 0
+    self.Lifespan = math.random(Config.TornadoMinLifespan, Config.TornadoMaxLifespan)
+    self.Visual = nil
+    self.PullRadius = self.Radius * 3
+    self.GroundPoint = nil
+    self.Running = false
+    self._connections = {}
+    return self
+end
+
+function Tornado:_applyWindTick()
+    -- Sweep nearby parts and humps
+    local center = self.Origin
+    local parts = workspace:FindPartsInRegion3WithWhiteList( -- deprecated but fine as example; replace with spatial queries for production
+        Region3.new(center - Vector3.new(self.PullRadius, 200, self.PullRadius), center + Vector3.new(self.PullRadius, 200, self.PullRadius)),
+        workspace:GetDescendants()
+    )
+    for _, part in pairs(parts) do
+        if not part:IsA("BasePart") then continue end
+        -- ignore massive baseplates, anchored heavy protected objects
+        if part:GetMass() and part:GetMass() > Config.PickupMassThreshold and part.Anchored then
+            continue
+        end
+
+        local dist = (part.Position - center).Magnitude
+        if dist > self.PullRadius then continue end
+
+        -- compute pull strength: stronger closer to funnel and with higher windspeed
+        local toward = (center - part.Position).Unit
+        local radialFactor = 1 - (dist / self.PullRadius)
+        local baseForce = self.WindSpeed * radialFactor
+
+        -- mass-aware response: smaller mass => bigger acceleration
+        local mass = part:GetMass()
+        local accel = baseForce / math.max(1, mass) * 100 -- scale constant to tune
+
+        -- gradual vertical lift if very close to center
+        local lift = 0
+        local liftRadius = math.max(3, self.Radius * 0.6)
+        if dist < liftRadius then
+            -- lift increases when closer and if windspeed strong
+            lift = (1 - (dist / liftRadius)) * (self.WindSpeed / 10)
+        end
+
+        -- apply velocity change (simple approach)
+        -- Note: setting AssemblyLinearVelocity directly is more robust across jointed assemblies
+        if part:IsDescendantOf(workspace) and not part.Anchored then
+            local current = part.AssemblyLinearVelocity
+            local desired = current + (toward * accel) + Vector3.new(0, lift, 0)
+            -- lerp for smoothness
+            part.AssemblyLinearVelocity = current:Lerp(desired, math.clamp(0.12 * (self.WindSpeed/100), 0.02, 0.6))
+        end
+
+        -- Damage over time for parts (anchored or not)
+        if part.Parent and part.Parent:IsA("Model") then
+            local model = part.Parent
+            if not model:FindFirstChild("TornadoIntegrity") then
+                local val = Instance.new("NumberValue")
+                val.Name = "TornadoIntegrity"
+                val.Value = 100 -- default hp; tune per-build
+                val.Parent = model
+            end
+            local integrity = model:FindFirstChild("TornadoIntegrity")
+            local dmg = Config.DamagePerSecondBase * (self.WindSpeed / 100) * radialFactor
+            integrity.Value = integrity.Value - dmg * Config.WindTickInterval
+            if integrity.Value <= 0 then
+                -- When destroyed, convert to debris or break parts; we simply unanchor and let physics act
+                for _, p in ipairs(model:GetDescendants()) do
+                    if p:IsA("BasePart") then
+                        p.Anchored = false
+                        p:BreakJoints()
+                    end
+                end
+            end
+        end
+
+        -- Player/NPC handling: if humanoid rootpart
+        local humanoid = part.Parent and part.Parent:FindFirstChildOfClass("Humanoid")
+        if humanoid and humanoid.RootPart then
+            local root = humanoid.RootPart
+            -- check shelter quickly (see Tornado.isSheltered below)
+            if Tornado.isSheltered(root.Position) then
+                -- sheltered: ignore wind effects
+            else
+                -- apply dragging first (horizontal) then lift as closer
+                local toCenter = (center - root.Position)
+                local horizontal = Vector3.new(toCenter.X, 0, toCenter.Z).Unit
+                local horizontalForce = horizontal * (self.WindSpeed * 0.6 * radialFactor)
+                local verticalForce = Vector3.new(0, lift * 6, 0)
+                -- apply to AssemblyLinearVelocity
+                local cur = root.AssemblyLinearVelocity
+                root.AssemblyLinearVelocity = cur:Lerp(cur + horizontalForce + verticalForce, 0.08)
+                -- if very close and wind strong, optionally set Humanoid.PlatformStand for dramatic lift (careful)
+            end
+        end
+    end
+end
+
+-- Basic shelter test: cast rays upward; if any part (including non-collidable) is above within small height, count as sheltered
+function Tornado.isSheltered(position)
+    -- simplistic approach: check for any part with top surface above this point inside a small box
+    local regionSize = Vector3.new(4, 8, 4)
+    local center = position + Vector3.new(0, 4, 0)
+    local region = Region3.new(center - regionSize/2, center + regionSize/2)
+    -- Region3 API returns only collidable parts historically, but treat non-collidable as shelter by checking all models by position
+    -- Fallback: check parts and also check for named shelter objects (tagged)
+    local parts = workspace:FindPartsInRegion3(region, nil, 50)
+    if #parts > 0 then
+        -- If any part is above the player's head (y > position.Y + 2), consider sheltered
+        for _, p in ipairs(parts) do
+            if p.Position.Y > position.Y + 2 then
+                return true
+            end
+        end
+    end
+    -- Additional check: look for parent models tagged as shelters (optional)
+    return false
+end
+
+function Tornado:start()
+    if self.Running then return end
+    self.Running = true
+    -- spawn visual funnel
+    local height = math.clamp(self.Radius * (4 + math.random()), 30, 200)
+    self.Visual = createFunnelVisual(self.Origin, height, self.Radius, math.random(0,360))
+    self._tick = RunService.Heartbeat:Connect(function(dt)
+        self.Age = self.Age + dt
+        -- slowly vary wind & radius over time (random breathing)
+        local t = math.sin(self.Age * 0.06 + (self.WindSpeed%10))
+        self.Radius = math.clamp(self.Radius + t * 0.3, Config.TornadoMinRadius, Config.TornadoMaxRadius)
+        self.PullRadius = self.Radius * (2.5 + math.abs(math.sin(self.Age*0.02))*1.5)
+        -- apply physics tick at intervals
+        if (math.floor(self.Age / Config.WindTickInterval) ~= math.floor((self.Age - dt)/Config.WindTickInterval)) then
+            self:_applyWindTick()
+        end
+
+        -- lifecycle: chance to strengthen or weaken
+        if math.random() < 0.0008 then
+            self.WindSpeed = math.clamp(self.WindSpeed + math.random(-10, 30), Config.TornadoMinWindspeed, Config.TornadoMaxWindspeed)
+        end
+
+        if self.Age >= self.Lifespan then
+            self:stop()
+        end
+    end)
+end
+
+function Tornado:stop()
+    if not self.Running then return end
+    self.Running = false
+    if self._tick then self._tick:Disconnect() end
+    if self.Visual and self.Visual.Parent then
+        Debris:AddItem(self.Visual, 4)
+    end
+    -- let physics calm down
+end
+
+return Tornado
+
+-- ReplicatedStorage.Modules.Config
+local Config = {}
+
+-- Visual
+Config.SmokeTexture = "rbxasset://textures/particles/smoke_main.dds"
+
+-- Cloud settings
+Config.CloudSpawnInterval = 6            -- seconds between attempts to spawn cloud blobs
+Config.MaxClouds = 30
+Config.CloudMinSize = 8                  -- roughly part size
+Config.CloudMaxSize = 40
+Config.CloudLifetime = 600               -- seconds
+
+-- Tornado settings
+Config.TornadoMinSpawnInterval = 300     -- 5 minutes
+Config.TornadoMaxSpawnInterval = 600     -- 10 minutes
+Config.TornadoMinLifespan = 60           -- seconds (rare to be very short)
+Config.TornadoMaxLifespan = 900          -- 15 minutes
+Config.TornadoTypicalLifespan = 420      -- 7 minutes typical
+Config.TornadoMinWindspeed = 60         -- arbitrary units
+Config.TornadoMaxWindspeed = 350
+Config.TornadoMinRadius = 8
+Config.TornadoMaxRadius = 80
+
+-- Formation settings
+Config.WallCloudClusterForTornado = 5    -- number of cloud blobs to consider forming
+Config.FormationSuccessChance = 0.92     -- can fail rarely
+
+-- Wind physics
+Config.WindTickInterval = 0.12          -- seconds per physics tick for wind application
+Config.PlayerDragFactor = 0.6           -- how strongly players are dragged
+Config.PickupMassThreshold = 500        -- models above this mass are too heavy (e.g., baseplate)
+Config.DamagePerSecondBase = 5
+
+-- Misc
+Config.MaxPickupDistance = 200          -- limit (won't spawn over void)
+Config.MinSpawnY = 1                    -- avoid spawning in negative/void
+return Config
+
 this one worked for a bit. it generated the paritlces.

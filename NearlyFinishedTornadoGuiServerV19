@@ -120,6 +120,40 @@ local function destroyAllWeldsAndAttachments(model)
 	end
 end
 
+-- --- NEW HELPERS: apply velocity / impulse only after part is unanchored ---
+local function applyVelocityWhenUnanchored(part, velocity)
+	if not part or not part.Parent then return end
+	task.spawn(function()
+		-- double-check still valid
+		if not part or not part.Parent then return end
+		-- if anchored, unanchor and wait one heartbeat for physics to update
+		if part.Anchored then
+			pcall(function() part.Anchored = false end)
+			-- wait a single physics frame to ensure part is simulated
+			pcall(function() RunService.Heartbeat:Wait() end)
+		end
+		-- apply velocity safely
+		if part and part.Parent then
+			pcall(function() part.AssemblyLinearVelocity = velocity end)
+		end
+	end)
+end
+
+local function applyImpulseWhenUnanchored(part, impulse)
+	if not part or not part.Parent then return end
+	task.spawn(function()
+		if not part or not part.Parent then return end
+		if part.Anchored then
+			pcall(function() part.Anchored = false end)
+			pcall(function() RunService.Heartbeat:Wait() end)
+		end
+		if part and part.Parent then
+			pcall(function() part:ApplyImpulse(impulse) end)
+		end
+	end)
+end
+-- -------------------------------------------------------------------
+
 -- Particle emitter helper: NO VelocityInheritance; rate forced to CONFIG.EM_RATE
 local function attachEmitter(part, baseScale)
 	local em = Instance.new("ParticleEmitter")
@@ -234,7 +268,8 @@ local function tossHRP_oneShot(rec, hrp, centerPos, windspeedMPH)
 	local mag = clamp(windspeedMPH * CONFIG.TOSS_VEL_MULT, 0, CONFIG.MAX_TOSS_VEL)
 	-- add randomness and mph-based vertical boost
 	local vertBoost = clamp(windspeedMPH * 0.28 + math.random() * (windspeedMPH * 0.18), 10, CONFIG.MAX_VERTICAL_VEL)
-	pcall(function() hrp.AssemblyLinearVelocity = away * mag + Vector3.new(0, vertBoost, 0) end)
+	-- apply velocity only after ensuring HRP is unanchored (HRPs are normally non-anchored but use helper for safety)
+	applyVelocityWhenUnanchored(hrp, away * mag + Vector3.new(0, vertBoost, 0))
 
 	-- track toss for fall damage calculation
 	local model = hrp.Parent
@@ -262,7 +297,7 @@ local function tossPart_oneShot(rec, part, centerPos, windspeedMPH)
 	if horiz.Magnitude == 0 then horiz = Vector3.new(1,0,0) end
 	local away = horiz.Unit
 	local mag = clamp(windspeedMPH * CONFIG.TOSS_VEL_MULT, 0, CONFIG.MAX_TOSS_VEL)
-	pcall(function() part.AssemblyLinearVelocity = away * mag + Vector3.new(0, clamp(windspeedMPH * 0.3, 10, CONFIG.MAX_VERTICAL_VEL), 0) end)
+	applyVelocityWhenUnanchored(part, away * mag + Vector3.new(0, clamp(windspeedMPH * 0.3, 10, CONFIG.MAX_VERTICAL_VEL), 0))
 end
 
 local function tossModel_oneShot(rec, model, centerPos, windspeedMPH)
@@ -278,10 +313,7 @@ local function tossModel_oneShot(rec, model, centerPos, windspeedMPH)
 
 	for _, p in ipairs(model:GetDescendants()) do
 		if p:IsA("BasePart") then
-			pcall(function()
-				if p:FindFirstChild("TornadoBV") then p.TornadoBV:Destroy() end
-				p.AssemblyLinearVelocity = away * mag + Vector3.new(0, clamp(windspeedMPH * 0.3, 10, CONFIG.MAX_VERTICAL_VEL), 0)
-			end)
+			applyVelocityWhenUnanchored(p, away * mag + Vector3.new(0, clamp(windspeedMPH * 0.3, 10, CONFIG.MAX_VERTICAL_VEL), 0))
 		end
 	end
 
@@ -360,7 +392,7 @@ local function tryImmediatePickupForDescendant(desc, lowerPart, windfieldRadius,
 				local dir = (lowerPart.Position - desc.Position)
 				if dir.Magnitude > 0 then dir = dir.Unit else dir = Vector3.new(0,1,0) end
 				local tang = Vector3.new(-dir.Z, 0, dir.X)
-				desc.AssemblyLinearVelocity = tang * clamp((windspeedMPH/80)*40, 10, 800) + Vector3.new(0, clamp(windspeedMPH*0.16, 10, CONFIG.MAX_VERTICAL_VEL), 0)
+				applyVelocityWhenUnanchored(desc, tang * clamp((windspeedMPH/80)*40, 10, 800) + Vector3.new(0, clamp(windspeedMPH*0.16, 10, CONFIG.MAX_VERTICAL_VEL), 0))
 			end)
 		end
 	elseif desc:IsA("Model") then
@@ -371,9 +403,9 @@ local function tryImmediatePickupForDescendant(desc, lowerPart, windfieldRadius,
 						for _, p in ipairs(desc:GetDescendants()) do
 							if p:IsA("BasePart") and not isWhitelisted(p) then
 								p.Anchored = false
-								p.AssemblyLinearVelocity = Vector3.new((p.Position - lowerPart.Position).Unit.X * clamp((windspeedMPH/80)*20, 6, 400),
+								applyVelocityWhenUnanchored(p, Vector3.new((p.Position - lowerPart.Position).Unit.X * clamp((windspeedMPH/80)*20, 6, 400),
 									clamp(windspeedMPH*0.14, 8, CONFIG.MAX_VERTICAL_VEL),
-									(p.Position - lowerPart.Position).Unit.Z * clamp((windspeedMPH/80)*20, 6, 400))
+									(p.Position - lowerPart.Position).Unit.Z * clamp((windspeedMPH/80)*20, 6, 400)))
 							end
 						end
 					end)
@@ -823,7 +855,7 @@ function spawnTornadoAt(spawnX, spawnZ, params, immediateFormation)
 							local horiz = Vector3.new(dir.X,0,dir.Z)
 							local away = horiz.Unit
 							-- give it a medium inward impulse so it moves toward funnel
-							p.AssemblyLinearVelocity = away * clamp((rec.params.windspeedMPH/80) * 40, 20, 400) + Vector3.new(0, clamp(rec.params.windspeedMPH * 0.12, 6, CONFIG.MAX_VERTICAL_VEL), 0)
+							applyVelocityWhenUnanchored(p, away * clamp((rec.params.windspeedMPH/80) * 40, 20, 400) + Vector3.new(0, clamp(rec.params.windspeedMPH * 0.12, 6, CONFIG.MAX_VERTICAL_VEL), 0))
 						end
 						state.nextIndex = state.nextIndex + 1
 						state.nextUnanchorTime = state.nextUnanchorTime + state.timePerPart
@@ -864,6 +896,7 @@ function spawnTornadoAt(spawnX, spawnZ, params, immediateFormation)
 		_moveDir = moveDir,
 		_moveSpeed = moveSpeed,
 		inFunnelTimers = {}, -- BasePart -> timeEntered
+		bigTornado = bigTornado,
 	}
 
 	-- applyParams now only affects the record that the server spawned (and only when called directly by server logic).
@@ -1127,7 +1160,7 @@ function spawnTornadoAt(spawnX, spawnZ, params, immediateFormation)
 								local dir = (centerPosNow - part.Position)
 								if dir.Magnitude > 0 then
 									local hv = Vector3.new(dir.X, 0, dir.Z).Unit * 400
-									part.AssemblyLinearVelocity = hv + Vector3.new(0, clamp(tornadoRecord.params.windspeedMPH * 0.08, 10, 1200), 0)
+									applyVelocityWhenUnanchored(part, hv + Vector3.new(0, clamp(tornadoRecord.params.windspeedMPH * 0.08, 10, 1200), 0))
 								end
 							end
 						end)
@@ -1150,7 +1183,7 @@ function spawnTornadoAt(spawnX, spawnZ, params, immediateFormation)
 								local hv = Vector3.new(dir.X, 0, dir.Z).Unit * 400
 								for _, p in ipairs(model:GetDescendants()) do
 									if p:IsA("BasePart") then
-										p.AssemblyLinearVelocity = hv + Vector3.new(0, clamp(tornadoRecord.params.windspeedMPH * 0.08, 10, 1200), 0)
+										applyVelocityWhenUnanchored(p, hv + Vector3.new(0, clamp(tornadoRecord.params.windspeedMPH * 0.08, 10, 1200), 0))
 									end
 								end
 							end
@@ -1307,7 +1340,7 @@ function spawnTornadoAt(spawnX, spawnZ, params, immediateFormation)
 					local dir = (centerPosNow - part.Position)
 					if dir.Magnitude > 0 then
 						local hv = Vector3.new(dir.X, 0, dir.Z).Unit * 400
-						part.AssemblyLinearVelocity = hv + Vector3.new(0, clamp(tornadoRecord.params.windspeedMPH * 0.08, 10, CONFIG.MAX_VERTICAL_VEL), 0)
+						applyVelocityWhenUnanchored(part, hv + Vector3.new(0, clamp(tornadoRecord.params.windspeedMPH * 0.08, 10, CONFIG.MAX_VERTICAL_VEL), 0))
 					end
 				else
 					local targetVel, distNow = computeDragAndLift(part.Position, centerPosNow, tornadoRecord.params.funnelDiameter, windfield, tornadoRecord.params.windspeedMPH, pm)
@@ -1315,10 +1348,10 @@ function spawnTornadoAt(spawnX, spawnZ, params, immediateFormation)
 					local closeness = 1 - clamp(distNow / (windfield + 1), 0, 1)
 					local blend = clamp(0.06 + closeness * 0.74, 0.02, 0.96)
 					local newVel = cur * (1-blend) + targetVel * blend
-					pcall(function() part.AssemblyLinearVelocity = newVel end)
+					applyVelocityWhenUnanchored(part, newVel)
 					-- small parts get occasional impulse
 					if pm < 6 and math.random() < 0.006 then
-						pcall(function() part:ApplyImpulse(Vector3.new(0, clamp(tornadoRecord.params.windspeedMPH*8, 30, 1600) * pm, 0)) end)
+						applyImpulseWhenUnanchored(part, Vector3.new(0, clamp(tornadoRecord.params.windspeedMPH*8, 30, 1600) * pm, 0))
 					end
 				end
 			else
@@ -1393,7 +1426,7 @@ function spawnTornadoAt(spawnX, spawnZ, params, immediateFormation)
 								part.Anchored = false
 								local radial = Vector3.new(part.Position.X - centerPosNow.X, 0, part.Position.Z - centerPosNow.Z)
 								local push = radial.Unit * clamp((tornadoRecord.params.windspeedMPH/6) * (1 + math.random()), 18, 1600)
-								part.AssemblyLinearVelocity = (Vector3.new(0, clamp(tornadoRecord.params.windspeedMPH * 0.8, 60, 1600), 0) + push)
+								applyVelocityWhenUnanchored(part, (Vector3.new(0, clamp(tornadoRecord.params.windspeedMPH * 0.8, 60, 1600), 0) + push))
 							end)
 						end
 					end
@@ -1619,63 +1652,67 @@ for _, pl in ipairs(Players:GetPlayers()) do
 end
 
 -- Handle SummonTornado fired from client (client sends numeric params)
-SummonTornadoEvent.OnServerEvent:Connect(function(player, params)
-	pcall(function()
-		if not isAllowedToUseCommands(player) then
-			warn(("[SummonTornado] %s tried to summon but lacks permission."):format(player.Name)); return
-		end
-		if not params or type(params) ~= "table" then
-			warn("[SummonTornado] invalid params from client."); return
-		end
-		-- Get spawn position from player's HRP (server-side)
-		local spawnX, spawnZ = 0, 0
-		if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
-			local hrp = player.Character.HumanoidRootPart
-			spawnX, spawnZ = hrp.Position.X, hrp.Position.Z
-		else
-			-- fallback: try head or 0,0
-			if player.Character and player.Character:FindFirstChild("Head") then
-				local head = player.Character.Head
-				spawnX, spawnZ = head.Position.X, head.Position.Z
-			else
-				spawnX, spawnZ = 0, 0
+local SummonTornadoEvent = tornadoFolder:FindFirstChild("SummonTornado")
+if SummonTornadoEvent then
+	SummonTornadoEvent.OnServerEvent:Connect(function(player, params)
+		pcall(function()
+			if not isAllowedToUseCommands(player) then
+				warn(("[SummonTornado] %s tried to summon but lacks permission."):format(player.Name)); return
 			end
-		end
+			if not params or type(params) ~= "table" then
+				warn("[SummonTornado] invalid params from client."); return
+			end
+			-- Get spawn position from player's HRP (server-side)
+			local spawnX, spawnZ = 0, 0
+			if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+				local hrp = player.Character.HumanoidRootPart
+				spawnX, spawnZ = hrp.Position.X, hrp.Position.Z
+			else
+				-- fallback: try head or 0,0
+				if player.Character and player.Character:FindFirstChild("Head") then
+					local head = player.Character.Head
+					spawnX, spawnZ = head.Position.X, head.Position.Z
+				else
+					spawnX, spawnZ = 0, 0
+				end
+			end
 
-		-- IMPORTANT: per admin request, we accept the raw numeric values (server is authoritative for behavior but does not clamp admin's requested numbers).
-		local fd = tonumber(params.funnelDiameter) or params.funnelDiameter or 300
-		local wr = tonumber(params.windfieldRadius) or params.windfieldRadius or math.max(fd + CONFIG.WINDFIELD_BUFFER, fd * 1.2)
-		local ws = tonumber(params.windspeedMPH) or params.windspeedMPH or 200
-		local ms = tonumber(params.moveSpeed) or params.moveSpeed or 3
-		local ls = tonumber(params.lifespan) or params.lifespan or 420
+			-- IMPORTANT: per admin request, we accept the raw numeric values (server is authoritative for behavior but does not clamp admin's requested numbers).
+			local fd = tonumber(params.funnelDiameter) or params.funnelDiameter or 300
+			local wr = tonumber(params.windfieldRadius) or params.windfieldRadius or math.max(fd + CONFIG.WINDFIELD_BUFFER, fd * 1.2)
+			local ws = tonumber(params.windspeedMPH) or params.windspeedMPH or 200
+			local ms = tonumber(params.moveSpeed) or params.moveSpeed or 3
+			local ls = tonumber(params.lifespan) or params.lifespan or 420
 
-		print(("[Tornado] Summon request from %s -> spawn=(%.1f,%.1f) funnel=%s windfield=%s wind=%s move=%s life=%s")
-			:format(player.Name, spawnX, spawnZ, tostring(fd), tostring(wr), tostring(ws), tostring(ms), tostring(ls)))
+			print(("[Tornado] Summon request from %s -> spawn=(%.1f,%.1f) funnel=%s windfield=%s wind=%s move=%s life=%s")
+				:format(player.Name, spawnX, spawnZ, tostring(fd), tostring(wr), tostring(ws), tostring(ms), tostring(ls)))
 
-		-- Spawn tornado (server authoritative). immediateFormation true to skip long cloud-delay
-		task.spawn(function()
-			spawnTornadoAt(spawnX, spawnZ, {
-				funnelDiameter = fd,
-				windfieldRadius = wr,
-				windspeedMPH = ws,
-				moveSpeed = ms,
-				lifespan = ls,
-				ownerUserId = player.UserId,
-			}, true)
+			-- Spawn tornado (server authoritative). immediateFormation true to skip long cloud-delay
+			task.spawn(function()
+				spawnTornadoAt(spawnX, spawnZ, {
+					funnelDiameter = fd,
+					windfieldRadius = wr,
+					windspeedMPH = ws,
+					moveSpeed = ms,
+					lifespan = ls,
+					ownerUserId = player.UserId,
+				}, true)
+			end)
 		end)
 	end)
-end)
+end
 
 -- Handle live param updates from client (optional) -- **INTENTIONALLY DOES NOTHING**
 -- Per request: do not let a newly opened client GUI rescale or otherwise control previously spawned tornadoes.
-UpdateTornadoEvent.OnServerEvent:Connect(function(player, params)
-	pcall(function()
-		-- Intentionally ignore client live-updates so GUI can't resize existing tornadoes.
-		-- If you want server-side control later, implement an explicit server command with explicit tornado-id.
-		if not isAllowedToUseCommands(player) then return end
-		-- log for debugging
-		-- print(("[UpdateTornadoParams] live update ignored from %s"):format(player.Name))
+local UpdateTornadoEventRef = tornadoFolder:FindFirstChild("UpdateTornadoParams")
+if UpdateTornadoEventRef then
+	UpdateTornadoEventRef.OnServerEvent:Connect(function(player, params)
+		pcall(function()
+			-- Intentionally ignore client live-updates so GUI can't resize existing tornadoes.
+			-- If you want server-side control later, implement an explicit server command with explicit tornado-id.
+			if not isAllowedToUseCommands(player) then return end
+		end)
 	end)
-end)
+end
 
 print("[StormGenerators] Tornado System (summon-only, customized) loaded on server. RemoteEvents available at ReplicatedStorage.TornadoEvents")

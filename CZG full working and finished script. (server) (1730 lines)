@@ -1,0 +1,1730 @@
+local zombie = script.Parent
+local humanoid = zombie:WaitForChild("Humanoid")
+local root = zombie:FindFirstChild("HumanoidRootPart") or zombie:FindFirstChild("Torso") or zombie:WaitForChild("Torso")
+
+local Players = game:GetService("Players")
+local ServerStorage = game:GetService("ServerStorage")
+local DestroyService = require(game.ServerStorage.ROBLOX_DestroyService)
+local ZombieSense = require(game.ServerScriptService:WaitForChild("ZombieSenseService"))
+
+local owningPlayer = Players:GetPlayerFromCharacter(zombie)
+if owningPlayer
+	and zombie:GetAttribute("IsZombie") ~= true
+	and zombie:GetAttribute("ConvertedPlayerZombie") ~= true
+	and owningPlayer:GetAttribute("ZombieRespawnLock") ~= true
+then
+	return
+end
+
+if zombie:GetAttribute("IsZombie") ~= true
+	and zombie:GetAttribute("ConvertedZombie") ~= true
+	and zombie:GetAttribute("ConvertedPlayerZombie") ~= true
+then
+	zombie:SetAttribute("IsZombie", true)
+end
+
+ZombieSense.RegisterZombie(zombie)
+
+--////////////////////////////////////////////////////////////
+-- TUNING
+--////////////////////////////////////////////////////////////
+local RUN_SPEED = 25
+local ALERT_SPEED = 15
+local WALK_SPEED = 10
+
+local LOOK_AROUND_TIME = 3
+local WANDER_MIN_DISTANCE = 3
+local WANDER_MAX_DISTANCE = 15
+local WANDER_MIN_WAIT = 10
+local WANDER_MAX_WAIT = 15
+local ARRIVE_DISTANCE = 7
+
+local ATTACK_DAMAGE = 30
+local ATTACK_COOLDOWN = 3
+local ATTACK_DURATION = 1.07
+local ATTACK_RANGE = 5
+
+local SOUND_TRIGGER_RATIO = 0.60
+local SOUND_ALERT_RATIO = 1.00
+
+local RUN_VIB_TRIGGER_RADIUS = 15
+local RUN_VIB_ALERT_RADIUS = 35
+local AIR_VIB_TRIGGER_RADIUS = 30
+local AIR_VIB_ALERT_RADIUS = 50
+local HEAVY_FALL_MULTIPLIER = 2
+
+local TARGET_EVENT_RANK = 3
+
+local CONVERT_CHECK_THRESHOLD = 20
+local CONVERT_SOUND_ID = "rbxassetid://89170569262400"
+local NPC_SCREAM_SOUND_ID = nil
+local CONVERT_ANIM_ID = "rbxassetid://139214660419503"
+local R6_CONVERT_ANIM_ID = "rbxassetid://74064039299504"
+local R15_BITE_ANIM_ID = "rbxassetid://110001241998420"
+local DEFAULT_BITE_ANIM_ID = "rbxassetid://135030001439615"
+local ZOMBIE_RISE_ANIM_ID = "rbxassetid://96619325060500"
+local R6_CONVERTED_GETUP_ANIM_ID = "rbxassetid://139162006820066"
+local CONVERT_SOUND_DURATION = 6
+local ZOMBIE_RISE_DURATION = 2.33
+local R6_CONVERTED_GETUP_DURATION = 2.0
+
+local CONVERTED_CORPSE_CLEANUP_TIME = 5
+local HUMAN_CORPSE_CLEANUP_TIME = 0.75
+local ZOMBIE_RESPAWN_TIME = 10
+local CONVERTING_CORPSE_CLEANUP_TIME = 20
+
+local ZOMBIE_GREEN = Color3.fromRGB(42, 78, 42)
+
+local R6_NORMAL_WALK_ANIM_ID = "rbxassetid://87099946173428"
+local R6_ALERT_ANIM_ID = "rbxassetid://104497546787277"
+local R6_TRIGGERED_ANIM_ID = "rbxassetid://127203905658195"
+
+local CLASSIC_R15_IDLE_ANIM_ID = "rbxassetid://507766666"
+local R15_CONVERTED_WANDER_WALK_ANIM_ID = "rbxassetid://89925399384409"
+local R15_CONVERTED_ALERT_WALK_ANIM_ID = "rbxassetid://116314145766372"
+local R15_CONVERTED_TRIGGERED_RUN_ANIM_ID = "rbxassetid://87903379537163"
+
+local SPEED_RESTORE_OFFSET = 0.5
+local SPEED_HISTORY_WINDOW = 3.0
+
+local BODY_PART_NAMES = {
+	Head = true,
+	Torso = true,
+	["Left Arm"] = true,
+	["Right Arm"] = true,
+	["Left Leg"] = true,
+	["Right Leg"] = true,
+	UpperTorso = true,
+	LowerTorso = true,
+	LeftUpperArm = true,
+	LeftLowerArm = true,
+	LeftHand = true,
+	RightUpperArm = true,
+	RightLowerArm = true,
+	RightHand = true,
+	LeftUpperLeg = true,
+	LeftLowerLeg = true,
+	LeftFoot = true,
+	RightUpperLeg = true,
+	RightLowerLeg = true,
+	RightFoot = true,
+}
+
+--////////////////////////////////////////////////////////////
+-- TEMPLATE STORAGE
+--////////////////////////////////////////////////////////////
+local ORIGINAL_SPAWN_CFRAME = zombie:GetPivot()
+
+local zombieTemplate
+do
+	local oldArchivable = zombie.Archivable
+	zombie.Archivable = true
+	zombieTemplate = zombie:Clone()
+	zombie.Archivable = oldArchivable
+end
+
+--////////////////////////////////////////////////////////////
+-- STATE
+--////////////////////////////////////////////////////////////
+local state = "Idle"
+local zombieDead = false
+
+local currentTargetPos = nil
+local currentTargetModel = nil
+local currentTargetHumanoid = nil
+local currentTargetKind = nil
+local currentTargetMemoryUntil = 0
+local currentTargetEndsAt = 0
+local lastHeardAt = 0
+local wanderGoal = nil
+local nextWanderAt = 0
+
+local attacking = false
+local attackEndsAt = 0
+local nextAttackAt = 0
+local attackTrack = nil
+
+local biteHold = nil
+local grabbedVictim = nil
+
+local conversionSessions = {}
+local victimDeathConnections = {}
+
+local speedHistory = {}
+
+local zombieRefreshQueued = false
+local zombieRespawnQueued = false
+local zombieDeathPivot = ORIGINAL_SPAWN_CFRAME
+local zombieDeathAt = 0
+
+local touchAttackCooldowns = {}
+local touchConnections = {}
+
+--////////////////////////////////////////////////////////////
+-- HELPERS
+--////////////////////////////////////////////////////////////
+local function clearParts(parent, delayTime)
+	for _, child in pairs(parent:GetChildren()) do
+		clearParts(child, delayTime)
+	end
+
+	local cleanupDelay = delayTime
+	if cleanupDelay == nil then
+		if parent:IsA("Part") then
+			cleanupDelay = math.random(5, 10)
+		else
+			cleanupDelay = 11
+		end
+	end
+
+	DestroyService:AddItem(parent, cleanupDelay)
+end
+
+local function getPlayerByUserId(userId)
+	local ok, result = pcall(function()
+		return Players:GetPlayerByUserId(userId)
+	end)
+
+	if ok and result then
+		return result
+	end
+
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p.UserId == userId then
+			return p
+		end
+	end
+
+	return nil
+end
+
+local function setBackpackHidden(playerObj, hidden)
+	if playerObj and playerObj.Parent then
+		pcall(function()
+			playerObj:SetAttribute("ZombieBackpackHidden", hidden == true)
+			playerObj:SetAttribute("ZombieConverting", hidden == true or playerObj:GetAttribute("ZombieConverting") == true)
+		end)
+	end
+end
+
+local function isZombieModel(model)
+	if not model then
+		return false
+	end
+
+	return model:GetAttribute("IsZombie") == true
+		or model:GetAttribute("ConvertedZombie") == true
+		or model:GetAttribute("ConvertedPlayerZombie") == true
+end
+
+local function isConvertingModel(model)
+	if not model then
+		return false
+	end
+	return model:GetAttribute("ZombieConverting") == true
+end
+
+local function getModelRoot(model)
+	if not model then
+		return nil
+	end
+
+	return model.PrimaryPart
+		or model:FindFirstChild("HumanoidRootPart")
+		or model:FindFirstChild("Torso")
+		or model:FindFirstChild("UpperTorso")
+		or model:FindFirstChildWhichIsA("BasePart")
+end
+
+local function getRootFromCharacter(character)
+	return getModelRoot(character)
+end
+
+local function setSpeed(speed)
+	if humanoid.WalkSpeed ~= speed then
+		humanoid.WalkSpeed = speed
+	end
+end
+
+local function disableJump(humanoidObj)
+	if not humanoidObj or not humanoidObj.Parent then
+		return
+	end
+
+	pcall(function()
+		humanoidObj.JumpPower = 0
+	end)
+	pcall(function()
+		humanoidObj.JumpHeight = 0
+	end)
+	pcall(function()
+		humanoidObj:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+	end)
+end
+
+local function restoreJumpSettings(humanoidObj, saved)
+	if not humanoidObj or not humanoidObj.Parent or not saved then
+		return
+	end
+
+	pcall(function()
+		humanoidObj.JumpPower = saved.JumpPower
+	end)
+	pcall(function()
+		humanoidObj.JumpHeight = saved.JumpHeight
+	end)
+	if saved.UseJumpPower ~= nil then
+		pcall(function()
+			humanoidObj.UseJumpPower = saved.UseJumpPower
+		end)
+	end
+	pcall(function()
+		humanoidObj:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+	end)
+end
+
+local function clearCurrentTarget()
+	currentTargetPos = nil
+	currentTargetModel = nil
+	currentTargetHumanoid = nil
+	currentTargetKind = nil
+	currentTargetMemoryUntil = 0
+	lastHeardAt = 0
+end
+
+local function resetAttackState()
+	attacking = false
+	attackEndsAt = 0
+end
+
+local function pruneSpeedHistory(character, nowTime)
+	local history = speedHistory[character]
+	if not history then
+		return
+	end
+
+	while #history > 0 and (nowTime - history[1].t) > SPEED_HISTORY_WINDOW do
+		table.remove(history, 1)
+	end
+
+	if #history == 0 then
+		speedHistory[character] = nil
+	end
+end
+
+local function recordCharacterSpeed(character, humanoidObj, nowTime)
+	if not character or not character.Parent or not humanoidObj or not humanoidObj.Parent then
+		return
+	end
+
+	local rootPart = getRootFromCharacter(character)
+	local moveSpeed = 0
+	if rootPart and rootPart:IsA("BasePart") then
+		local vel = rootPart.AssemblyLinearVelocity
+		moveSpeed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+	end
+
+	local effectiveSpeed = math.max(humanoidObj.WalkSpeed or 0, moveSpeed or 0)
+
+	local history = speedHistory[character]
+	if not history then
+		history = {}
+		speedHistory[character] = history
+	end
+
+	local lastSample = history[#history]
+	if not lastSample
+		or math.abs((lastSample.effectiveSpeed or 0) - effectiveSpeed) >= 0.1
+		or (nowTime - (lastSample.t or 0)) >= 0.1
+	then
+		table.insert(history, {
+			t = nowTime,
+			walkSpeed = humanoidObj.WalkSpeed or 0,
+			moveSpeed = moveSpeed,
+			effectiveSpeed = effectiveSpeed,
+		})
+	end
+
+	pruneSpeedHistory(character, nowTime)
+end
+
+local function getHistoricalSpeed(character, secondsAgo, fallback)
+	local history = speedHistory[character]
+	if not history or #history == 0 then
+		return fallback
+	end
+
+	local targetTime = time() - (secondsAgo or SPEED_RESTORE_OFFSET)
+
+	local bestBefore = nil
+	local bestBeforeDt = math.huge
+	local bestAny = fallback
+	local bestAnyDt = math.huge
+
+	for _, sample in ipairs(history) do
+		local sampleSpeed = sample.effectiveSpeed or sample.walkSpeed or sample.moveSpeed or fallback
+		local dt = math.abs(sample.t - targetTime)
+
+		if dt < bestAnyDt then
+			bestAnyDt = dt
+			bestAny = sampleSpeed
+		end
+
+		if sample.t <= targetTime and dt < bestBeforeDt then
+			bestBeforeDt = dt
+			bestBefore = sampleSpeed
+		end
+	end
+
+	local chosen = bestBefore or bestAny or fallback
+	if typeof(chosen) ~= "number" then
+		chosen = fallback or WALK_SPEED
+	end
+
+	return math.max(0, math.floor(chosen + 0.5))
+end
+
+local function loadAnimator(hum)
+	local animator = hum:FindFirstChildOfClass("Animator")
+	if not animator then
+		animator = Instance.new("Animator")
+		animator.Parent = hum
+	end
+	return animator
+end
+
+local function playOneShotAnimation(hum, animId)
+	local animator = loadAnimator(hum)
+	local anim = Instance.new("Animation")
+	anim.AnimationId = animId
+	local track = animator:LoadAnimation(anim)
+	track.Priority = Enum.AnimationPriority.Action
+	track:Play(0)
+	return track, anim
+end
+
+local function getRigTypeNameFromHumanoid(hum)
+	if hum and hum.RigType == Enum.HumanoidRigType.R6 then
+		return "R6"
+	end
+	return "R15"
+end
+
+local function playAttackAnimation()
+	pcall(function()
+		if attackTrack then
+			attackTrack:Stop(0)
+			attackTrack:Destroy()
+		end
+	end)
+
+	local animId = DEFAULT_BITE_ANIM_ID
+	if zombie:GetAttribute("ConvertedRigType") == "R15" then
+		animId = R15_BITE_ANIM_ID
+	end
+
+	attackTrack = playOneShotAnimation(humanoid, animId)
+end
+
+local function playConversionAnimation(victimHumanoid)
+	local animId = CONVERT_ANIM_ID
+	if victimHumanoid and victimHumanoid.RigType == Enum.HumanoidRigType.R6 then
+		animId = R6_CONVERT_ANIM_ID
+	end
+	return playOneShotAnimation(victimHumanoid, animId)
+end
+
+local function playNpcScream(parentPart)
+	if not parentPart or not parentPart.Parent then
+		return nil
+	end
+
+	local soundId = NPC_SCREAM_SOUND_ID or CONVERT_SOUND_ID
+
+	local scream = Instance.new("Sound")
+	scream.Name = "NpcScream"
+	scream.SoundId = soundId
+	scream.Volume = 1.15
+	scream.RollOffMaxDistance = 80
+	scream.PlaybackSpeed = 1.1
+	scream.Parent = parentPart
+	scream:Play()
+
+	task.delay(1.25, function()
+		if scream and scream.Parent then
+			pcall(function()
+				scream:Stop()
+				scream:Destroy()
+			end)
+		end
+	end)
+
+	return scream
+end
+
+local function isCharacterBodyPart(part)
+	return part and part:IsA("BasePart") and BODY_PART_NAMES[part.Name] == true
+end
+
+local function colorZombieModel(model)
+	for _, desc in ipairs(model:GetDescendants()) do
+		if desc:IsA("BasePart") and isCharacterBodyPart(desc) then
+			desc.Color = ZOMBIE_GREEN
+		elseif desc:IsA("BodyColors") then
+			pcall(function()
+				desc.HeadColor3 = ZOMBIE_GREEN
+				desc.LeftArmColor3 = ZOMBIE_GREEN
+				desc.RightArmColor3 = ZOMBIE_GREEN
+				desc.LeftLegColor3 = ZOMBIE_GREEN
+				desc.RightLegColor3 = ZOMBIE_GREEN
+				desc.TorsoColor3 = ZOMBIE_GREEN
+			end)
+		end
+	end
+end
+
+local function removeCharacterScripts(model)
+	for _, desc in ipairs(model:GetDescendants()) do
+		if desc:IsA("LocalScript") or desc:IsA("Script") or desc:IsA("ModuleScript") then
+			desc:Destroy()
+		end
+	end
+end
+
+local function copyZombieScriptsInto(model)
+	local moduleFolder = zombie:FindFirstChild("ModuleScripts")
+	if moduleFolder then
+		moduleFolder:Clone().Parent = model
+	end
+
+	local clonedScript = script:Clone()
+	clonedScript.Parent = model
+end
+
+local function copyHumanoidScaleValues(sourceHumanoid, targetHumanoid)
+	if not sourceHumanoid or not targetHumanoid then
+		return
+	end
+
+	local scaleNames = {
+		"BodyHeightScale",
+		"BodyWidthScale",
+		"BodyDepthScale",
+		"HeadScale",
+		"BodyProportionScale",
+		"BodyTypeScale",
+	}
+
+	for _, name in ipairs(scaleNames) do
+		local obj = sourceHumanoid:FindFirstChild(name)
+		if obj and obj:IsA("NumberValue") then
+			local clonedValue = Instance.new("NumberValue")
+			clonedValue.Name = name
+			clonedValue.Value = obj.Value
+			clonedValue.Parent = targetHumanoid
+		end
+	end
+end
+
+local function prepareCorpseForCleanup(model)
+	if not model or not model.Parent then
+		return
+	end
+
+	for _, desc in ipairs(model:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			desc.Anchored = false
+			desc.CanCollide = true
+			desc.CanTouch = true
+			desc.CanQuery = true
+			desc.AssemblyLinearVelocity = Vector3.zero
+			desc.AssemblyAngularVelocity = Vector3.zero
+		end
+	end
+
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	if hum then
+		pcall(function()
+			hum.BreakJointsOnDeath = true
+			hum.PlatformStand = true
+			hum.AutoRotate = false
+			hum.WalkSpeed = 0
+		end)
+	end
+end
+
+local function cleanupCorpseAfter(model, seconds)
+	if not model then
+		return
+	end
+
+	task.delay(seconds or CONVERTED_CORPSE_CLEANUP_TIME, function()
+		if model and model.Parent then
+			pcall(function()
+				model:Destroy()
+			end)
+		end
+	end)
+end
+
+local function setupMovementAnimationController(model, hum)
+	local animator = loadAnimator(hum)
+
+	local controller = {
+		rigType = hum.RigType,
+		current = nil,
+		tracks = {},
+		anims = {},
+	}
+
+	local function loadTrack(id, priority, looped)
+		local anim = Instance.new("Animation")
+		anim.AnimationId = id
+		local track = animator:LoadAnimation(anim)
+		track.Priority = priority
+		track.Looped = looped == true
+		return track, anim
+	end
+
+	local function stopTrack(track)
+		if track then
+			pcall(function()
+				track:Stop(0.1)
+			end)
+		end
+	end
+
+	local function stopAll()
+		for _, track in pairs(controller.tracks) do
+			stopTrack(track)
+		end
+	end
+
+	controller.stopAll = stopAll
+
+	if hum.RigType == Enum.HumanoidRigType.R6 then
+		local walkTrack, walkAnim = loadTrack(R6_NORMAL_WALK_ANIM_ID, Enum.AnimationPriority.Movement, true)
+		local alertTrack, alertAnim = loadTrack(R6_ALERT_ANIM_ID, Enum.AnimationPriority.Action, true)
+		local triggeredTrack, triggeredAnim = loadTrack(R6_TRIGGERED_ANIM_ID, Enum.AnimationPriority.Action, true)
+
+		controller.tracks.walk = walkTrack
+		controller.tracks.alert = alertTrack
+		controller.tracks.triggered = triggeredTrack
+		controller.anims.walk = walkAnim
+		controller.anims.alert = alertAnim
+		controller.anims.triggered = triggeredAnim
+
+		function controller:setState(newState)
+			if self.current == newState then
+				return
+			end
+			self.current = newState
+			stopAll()
+
+			if newState == "Wander" then
+				pcall(function() walkTrack:Play(0.1) end)
+			elseif newState == "Alert" then
+				pcall(function() alertTrack:Play(0.1) end)
+			elseif newState == "Run" or newState == "Attack" then
+				pcall(function() triggeredTrack:Play(0.1) end)
+			end
+		end
+	else
+		local idleTrack, idleAnim = loadTrack(CLASSIC_R15_IDLE_ANIM_ID, Enum.AnimationPriority.Idle, true)
+		local walkTrack, walkAnim = loadTrack(R15_CONVERTED_WANDER_WALK_ANIM_ID, Enum.AnimationPriority.Movement, true)
+		local alertTrack, alertAnim = loadTrack(R15_CONVERTED_ALERT_WALK_ANIM_ID, Enum.AnimationPriority.Movement, true)
+		local triggeredTrack, triggeredAnim = loadTrack(R15_CONVERTED_TRIGGERED_RUN_ANIM_ID, Enum.AnimationPriority.Action, true)
+
+		controller.tracks.idle = idleTrack
+		controller.tracks.walk = walkTrack
+		controller.tracks.alert = alertTrack
+		controller.tracks.triggered = triggeredTrack
+		controller.anims.idle = idleAnim
+		controller.anims.walk = walkAnim
+		controller.anims.alert = alertAnim
+		controller.anims.triggered = triggeredAnim
+
+		function controller:setState(newState)
+			if self.current == newState then
+				return
+			end
+			self.current = newState
+			stopAll()
+
+			if newState == "Wander" then
+				pcall(function() walkTrack:Play(0.1) end)
+			elseif newState == "Alert" then
+				pcall(function() alertTrack:Play(0.1) end)
+			elseif newState == "Run" or newState == "Attack" then
+				pcall(function() triggeredTrack:Play(0.1) end)
+			else
+				pcall(function() idleTrack:Play(0.1) end)
+			end
+		end
+	end
+
+	return controller
+end
+
+local movementAnimController = setupMovementAnimationController(zombie, humanoid)
+
+local function getOwningPlayerFromModel(model)
+	if not model then
+		return nil
+	end
+
+	local userId = model:GetAttribute("ConvertedPlayerUserId")
+	if typeof(userId) == "number" then
+		local p = getPlayerByUserId(userId)
+		if p then
+			return p
+		end
+	end
+
+	return Players:GetPlayerFromCharacter(model)
+end
+
+local function cloneModelForConversion(sourceModel)
+	if not sourceModel then
+		return nil
+	end
+
+	local oldArchivable = sourceModel.Archivable
+	sourceModel.Archivable = true
+	local cloned = sourceModel:Clone()
+	sourceModel.Archivable = oldArchivable
+	return cloned
+end
+
+local function releaseVictim(keepLock)
+	if not grabbedVictim then
+		return
+	end
+
+	local g = grabbedVictim
+	grabbedVictim = nil
+
+	if g.model and g.model.Parent and not keepLock then
+		g.model:SetAttribute("ZombieGrabLocked", false)
+	end
+
+	if g.player then
+		setBackpackHidden(g.player, false)
+		g.player:SetAttribute("ZombieConverting", false)
+	end
+
+	if g.diedConn and not keepLock then
+		pcall(function()
+			g.diedConn:Disconnect()
+		end)
+		victimDeathConnections[g.model] = nil
+	end
+
+	if g.weld and g.weld.Parent then
+		g.weld:Destroy()
+	end
+
+	if g.root and g.root.Parent then
+		g.root.AssemblyLinearVelocity = Vector3.zero
+		g.root.AssemblyAngularVelocity = Vector3.zero
+		if keepLock then
+			g.root.Anchored = true
+		else
+			g.root.Anchored = g.saved.RootAnchored
+		end
+	end
+
+	if g.humanoid and g.humanoid.Parent then
+		if not keepLock then
+			g.humanoid.PlatformStand = g.saved.PlatformStand
+			g.humanoid.AutoRotate = g.saved.AutoRotate
+			g.humanoid.WalkSpeed = g.saved.WalkSpeed
+			restoreJumpSettings(g.humanoid, g.saved)
+			if g.saved.BreakJointsOnDeath ~= nil then
+				pcall(function()
+					g.humanoid.BreakJointsOnDeath = g.saved.BreakJointsOnDeath
+				end)
+			end
+			pcall(function()
+				g.humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+			end)
+		end
+	end
+
+	if g.partCollisions and not keepLock then
+		for part, oldValue in pairs(g.partCollisions) do
+			if part and part.Parent then
+				part.CanCollide = oldValue
+			end
+		end
+	end
+end
+
+local function ensureBiteHold()
+	if biteHold and biteHold.Parent then
+		return biteHold
+	end
+
+	biteHold = Instance.new("Part")
+	biteHold.Name = "BiteHold"
+	biteHold.Size = Vector3.new(1, 1, 1)
+	biteHold.Transparency = 1
+	biteHold.CanCollide = false
+	biteHold.CanQuery = false
+	biteHold.CanTouch = false
+	biteHold.Massless = true
+	biteHold.Anchored = false
+	biteHold.Parent = zombie
+	biteHold.CFrame = root.CFrame * CFrame.new(0, 0.4, -2.0)
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = root
+	weld.Part1 = biteHold
+	weld.Parent = biteHold
+
+	return biteHold
+end
+
+local function respawnZombieAtCFrame(returnCFrame)
+	if zombieRefreshQueued then
+		return
+	end
+	zombieRefreshQueued = true
+
+	task.defer(function()
+		if not zombie or not zombie.Parent then
+			return
+		end
+
+		local oldZombie = zombie
+		local source = zombieTemplate or zombie
+
+		local oldArchivable = source.Archivable
+		source.Archivable = true
+		local newZombie = source:Clone()
+		source.Archivable = oldArchivable
+
+		if not newZombie then
+			return
+		end
+
+		newZombie.Parent = workspace
+		newZombie:PivotTo(returnCFrame or ORIGINAL_SPAWN_CFRAME)
+		newZombie:SetAttribute("IsZombie", true)
+
+		if oldZombie:GetAttribute("ConvertedPlayerZombie") == true then
+			newZombie:SetAttribute("ConvertedPlayerZombie", true)
+			local uid = oldZombie:GetAttribute("ConvertedPlayerUserId")
+			if typeof(uid) == "number" then
+				newZombie:SetAttribute("ConvertedPlayerUserId", uid)
+			end
+		else
+			newZombie:SetAttribute("ConvertedPlayerZombie", nil)
+			newZombie:SetAttribute("ConvertedPlayerUserId", nil)
+		end
+
+		local oldRig = oldZombie:GetAttribute("ConvertedRigType")
+		if typeof(oldRig) == "string" then
+			newZombie:SetAttribute("ConvertedRigType", oldRig)
+		else
+			newZombie:SetAttribute("ConvertedRigType", nil)
+		end
+
+		newZombie:SetAttribute("ZombieConverting", nil)
+		newZombie:SetAttribute("ZombieGrabLocked", nil)
+
+		for _, desc in ipairs(newZombie:GetDescendants()) do
+			if desc:IsA("BasePart") then
+				desc.Anchored = false
+				desc.CanCollide = true
+				desc.CanTouch = true
+				desc.CanQuery = true
+				desc.AssemblyLinearVelocity = Vector3.zero
+				desc.AssemblyAngularVelocity = Vector3.zero
+				pcall(function()
+					desc:SetNetworkOwner(nil)
+				end)
+			end
+		end
+
+		local newHumanoid = newZombie:FindFirstChildOfClass("Humanoid")
+		if newHumanoid then
+			newHumanoid.Health = newHumanoid.MaxHealth
+		end
+
+		task.delay(0.05, function()
+			if oldZombie and oldZombie.Parent then
+				oldZombie:Destroy()
+			end
+		end)
+	end)
+end
+
+local function getActiveConversionCount()
+	local count = 0
+	for _ in pairs(conversionSessions) do
+		count += 1
+	end
+	return count
+end
+
+local function makeConvertedZombie(victimModel, sourceModel)
+	local player = getOwningPlayerFromModel(victimModel)
+	local victimHumanoid = victimModel:FindFirstChildOfClass("Humanoid")
+	local rigTypeName = getRigTypeNameFromHumanoid(victimHumanoid)
+	local sourceMaxHealth = 100
+	if victimHumanoid then
+		sourceMaxHealth = math.max(victimHumanoid.MaxHealth or victimHumanoid.Health or 100, 1)
+	end
+
+	local cloneSource = sourceModel or victimModel
+	if not cloneSource then
+		return nil
+	end
+
+	local oldArchivable = cloneSource.Archivable
+	cloneSource.Archivable = true
+	local newZombie = cloneSource:Clone()
+	cloneSource.Archivable = oldArchivable
+
+	if not newZombie then
+		return nil
+	end
+
+	newZombie.Name = (player and (player.Name .. "_Zombie")) or (victimModel.Name .. "_Zombie")
+
+	removeCharacterScripts(newZombie)
+	colorZombieModel(newZombie)
+
+	newZombie:SetAttribute("ConvertedRigType", rigTypeName)
+	newZombie:SetAttribute("IsZombie", true)
+	newZombie:SetAttribute("ConvertedZombie", true)
+
+	if player then
+		newZombie:SetAttribute("ConvertedPlayerZombie", true)
+		newZombie:SetAttribute("ConvertedPlayerUserId", player.UserId)
+		pcall(function()
+			player.CharacterAutoLoads = false
+		end)
+		player:SetAttribute("ZombieRespawnLock", true)
+	else
+		newZombie:SetAttribute("ConvertedPlayerZombie", nil)
+		newZombie:SetAttribute("ConvertedPlayerUserId", nil)
+	end
+
+	local newHumanoid = newZombie:FindFirstChildOfClass("Humanoid")
+	if not newHumanoid then
+		newHumanoid = Instance.new("Humanoid")
+		newHumanoid.Name = "Humanoid"
+		newHumanoid.Parent = newZombie
+	end
+
+	newHumanoid.MaxHealth = sourceMaxHealth
+	newHumanoid.Health = newHumanoid.MaxHealth
+	newHumanoid.AutoRotate = false
+	newHumanoid.RequiresNeck = false
+	newHumanoid.BreakJointsOnDeath = true
+
+	local newRoot = getModelRoot(newZombie)
+	if newRoot then
+		newZombie.PrimaryPart = newRoot
+	end
+
+	newZombie.Parent = workspace
+	newZombie:PivotTo(victimModel:GetPivot())
+
+	copyZombieScriptsInto(newZombie)
+
+	for _, desc in ipairs(newZombie:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			desc.Anchored = false
+			desc.CanCollide = true
+			desc.CanTouch = true
+			desc.CanQuery = true
+			desc.AssemblyLinearVelocity = Vector3.zero
+			desc.AssemblyAngularVelocity = Vector3.zero
+			pcall(function()
+				desc:SetNetworkOwner(nil)
+			end)
+		end
+	end
+
+	local riseAnimId = ZOMBIE_RISE_ANIM_ID
+	local riseDuration = ZOMBIE_RISE_DURATION
+	if rigTypeName == "R6" then
+		riseAnimId = R6_CONVERTED_GETUP_ANIM_ID
+		riseDuration = R6_CONVERTED_GETUP_DURATION
+	end
+
+	local riseTrack, riseAnimObj = playOneShotAnimation(newHumanoid, riseAnimId)
+
+	task.delay(riseDuration, function()
+		if newZombie.Parent and newHumanoid.Parent then
+			newHumanoid.AutoRotate = true
+			newHumanoid.WalkSpeed = WALK_SPEED
+		end
+	end)
+
+	task.delay(riseDuration, function()
+		if riseTrack then
+			pcall(function()
+				riseTrack:Stop(0)
+				riseTrack:Destroy()
+			end)
+		end
+		if riseAnimObj then
+			riseAnimObj:Destroy()
+		end
+	end)
+
+	newHumanoid.Died:Connect(function()
+		if newZombie and newZombie.Parent then
+			prepareCorpseForCleanup(newZombie)
+			cleanupCorpseAfter(newZombie, CONVERTED_CORPSE_CLEANUP_TIME)
+		end
+	end)
+
+	return newZombie
+end
+
+local function cancelConversionSession(victimModel)
+	local session = conversionSessions[victimModel]
+	if not session then
+		return
+	end
+
+	session.cancelled = true
+
+	if session.player then
+		setBackpackHidden(session.player, false)
+	end
+
+	if victimDeathConnections[victimModel] then
+		pcall(function()
+			victimDeathConnections[victimModel]:Disconnect()
+		end)
+		victimDeathConnections[victimModel] = nil
+	end
+
+	if session.diedConn then
+		pcall(function()
+			session.diedConn:Disconnect()
+		end)
+	end
+
+	if session.sound and session.sound.Parent then
+		pcall(function()
+			session.sound:Stop()
+			session.sound:Destroy()
+		end)
+	end
+
+	if session.screamSound and session.screamSound.Parent then
+		pcall(function()
+			session.screamSound:Stop()
+			session.screamSound:Destroy()
+		end)
+	end
+
+	if session.convertAnim then
+		pcall(function()
+			session.convertAnim:Stop(0)
+			session.convertAnim:Destroy()
+		end)
+	end
+
+	if session.convertAnimObj then
+		pcall(function()
+			session.convertAnimObj:Destroy()
+		end)
+	end
+
+	if session.conversionSource then
+		pcall(function()
+			if session.conversionSource.Parent then
+				session.conversionSource:Destroy()
+			end
+		end)
+	end
+
+	if session.model and session.model.Parent then
+		session.model:SetAttribute("ZombieConverting", nil)
+		session.model:SetAttribute("ZombieGrabLocked", false)
+	end
+
+	if session.root and session.root.Parent then
+		session.root.Anchored = session.saved.RootAnchored
+		session.root.AssemblyLinearVelocity = Vector3.zero
+		session.root.AssemblyAngularVelocity = Vector3.zero
+	end
+
+	if session.humanoid and session.humanoid.Parent then
+		session.humanoid.PlatformStand = session.saved.PlatformStand
+		session.humanoid.AutoRotate = session.saved.AutoRotate
+		session.humanoid.WalkSpeed = session.saved.WalkSpeed
+		restoreJumpSettings(session.humanoid, session.saved)
+		if session.saved.BreakJointsOnDeath ~= nil then
+			pcall(function()
+				session.humanoid.BreakJointsOnDeath = session.saved.BreakJointsOnDeath
+			end)
+		end
+		pcall(function()
+			session.humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+		end)
+	end
+
+	if session.partCollisions then
+		for part, oldValue in pairs(session.partCollisions) do
+			if part and part.Parent then
+				part.CanCollide = oldValue
+			end
+		end
+	end
+
+	conversionSessions[victimModel] = nil
+end
+
+local function playConversionSequence(victimModel, victimHumanoid)
+	local victimRoot = getModelRoot(victimModel)
+	if not victimRoot or not victimHumanoid then
+		return
+	end
+
+	local victimPlayer = getOwningPlayerFromModel(victimModel)
+
+	local session = {
+		model = victimModel,
+		humanoid = victimHumanoid,
+		root = victimRoot,
+		player = victimPlayer,
+		saved = {
+			PlatformStand = victimHumanoid.PlatformStand,
+			AutoRotate = victimHumanoid.AutoRotate,
+			WalkSpeed = victimHumanoid.WalkSpeed,
+			JumpPower = victimHumanoid.JumpPower,
+			JumpHeight = victimHumanoid.JumpHeight,
+			UseJumpPower = victimHumanoid.UseJumpPower,
+			Health = victimHumanoid.Health,
+			RootAnchored = victimRoot.Anchored,
+			BreakJointsOnDeath = victimHumanoid.BreakJointsOnDeath,
+		},
+		cancelled = false,
+		victimDiedDuringConversion = false,
+		sound = nil,
+		screamSound = nil,
+		convertAnim = nil,
+		convertAnimObj = nil,
+		partCollisions = nil,
+		diedConn = nil,
+		conversionSource = nil,
+	}
+
+	conversionSessions[victimModel] = session
+
+	victimModel:SetAttribute("ZombieConverting", true)
+	victimModel:SetAttribute("ZombieGrabLocked", true)
+
+	if victimPlayer then
+		setBackpackHidden(victimPlayer, true)
+		victimPlayer:SetAttribute("ZombieConverting", true)
+	end
+
+	local convertSource = cloneModelForConversion(victimModel)
+	session.conversionSource = convertSource
+
+	local convertSound = Instance.new("Sound")
+	convertSound.SoundId = CONVERT_SOUND_ID
+	convertSound.Volume = 1
+	convertSound.RollOffMaxDistance = 80
+	convertSound.Parent = victimRoot
+	convertSound:Play()
+	session.sound = convertSound
+
+	if not victimPlayer then
+		session.screamSound = playNpcScream(victimRoot)
+	end
+
+	local convertAnim, convertAnimObj = playConversionAnimation(victimHumanoid)
+	session.convertAnim = convertAnim
+	session.convertAnimObj = convertAnimObj
+
+	victimHumanoid.AutoRotate = false
+	victimHumanoid.WalkSpeed = 0
+	victimHumanoid.BreakJointsOnDeath = true
+	disableJump(victimHumanoid)
+
+	session.diedConn = victimHumanoid.Died:Connect(function()
+		session.victimDiedDuringConversion = true
+		if session.model and session.model.Parent then
+			prepareCorpseForCleanup(session.model)
+			session.model:SetAttribute("ZombieConverting", true)
+			session.model:SetAttribute("ZombieGrabLocked", true)
+		end
+	end)
+
+	task.delay(CONVERT_SOUND_DURATION, function()
+		if convertSound and convertSound.Parent then
+			pcall(function()
+				convertSound:Stop()
+				convertSound:Destroy()
+			end)
+		end
+	end)
+
+	task.wait(CONVERT_SOUND_DURATION)
+
+	if session.cancelled or not victimModel.Parent then
+		cancelConversionSession(victimModel)
+		return
+	end
+
+	local newZombie = makeConvertedZombie(victimModel, session.conversionSource)
+	if not newZombie then
+		cancelConversionSession(victimModel)
+		return
+	end
+
+	if victimPlayer then
+		if victimHumanoid and victimHumanoid.Parent and victimHumanoid.Health > 0 then
+			pcall(function()
+				victimHumanoid.Health = 0
+			end)
+		end
+		task.delay(HUMAN_CORPSE_CLEANUP_TIME, function()
+			if victimModel and victimModel.Parent then
+				victimModel:Destroy()
+			end
+		end)
+	else
+		if victimHumanoid and victimHumanoid.Parent then
+			pcall(function()
+				victimHumanoid.Health = victimHumanoid.MaxHealth
+				victimHumanoid.PlatformStand = false
+				victimHumanoid.AutoRotate = true
+				victimHumanoid.WalkSpeed = 0
+				restoreJumpSettings(victimHumanoid, session.saved)
+				victimHumanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+			end)
+		end
+
+		task.defer(function()
+			if victimModel and victimModel.Parent then
+				victimModel:Destroy()
+			end
+		end)
+	end
+
+	if convertAnim then
+		pcall(function()
+			convertAnim:Stop(0)
+			convertAnim:Destroy()
+		end)
+	end
+	if convertAnimObj then
+		convertAnimObj:Destroy()
+	end
+
+	if session.conversionSource then
+		pcall(function()
+			if session.conversionSource.Parent then
+				session.conversionSource:Destroy()
+			end
+		end)
+	end
+
+	cancelConversionSession(victimModel)
+
+	clearCurrentTarget()
+	resetAttackState()
+	state = "Idle"
+	setSpeed(0)
+	if movementAnimController then
+		movementAnimController:setState("Idle")
+	end
+end
+
+local function beginGrab(targetModel, targetHumanoid)
+	if attacking then
+		return false
+	end
+
+	if time() < nextAttackAt then
+		return false
+	end
+
+	if not targetModel or not targetHumanoid or targetHumanoid.Health <= 0 then
+		return false
+	end
+
+	if isZombieModel(targetModel) or isConvertingModel(targetModel) then
+		return false
+	end
+
+	if targetModel:GetAttribute("ZombieGrabLocked") == true then
+		return false
+	end
+
+	local targetRoot = getModelRoot(targetModel)
+	if not targetRoot then
+		return false
+	end
+
+	local targetPlayer = getOwningPlayerFromModel(targetModel)
+	local holdPart = ensureBiteHold()
+
+	attacking = true
+	attackEndsAt = time() + ATTACK_DURATION
+	nextAttackAt = time() + ATTACK_COOLDOWN
+	state = "Attack"
+
+	targetModel:SetAttribute("ZombieGrabLocked", true)
+	if targetPlayer then
+		setBackpackHidden(targetPlayer, true)
+		targetPlayer:SetAttribute("ZombieConverting", true)
+	end
+
+	setSpeed(0)
+	humanoid:MoveTo(root.Position)
+	playAttackAnimation()
+
+	local restoredSpeed = getHistoricalSpeed(targetModel, SPEED_RESTORE_OFFSET, targetHumanoid.WalkSpeed)
+
+	local saved = {
+		PlatformStand = targetHumanoid.PlatformStand,
+		AutoRotate = targetHumanoid.AutoRotate,
+		WalkSpeed = restoredSpeed,
+		JumpPower = targetHumanoid.JumpPower,
+		JumpHeight = targetHumanoid.JumpHeight,
+		UseJumpPower = targetHumanoid.UseJumpPower,
+		Health = targetHumanoid.Health,
+		RootAnchored = targetRoot.Anchored,
+		BreakJointsOnDeath = targetHumanoid.BreakJointsOnDeath,
+	}
+
+	local collisionSave = {}
+	for _, desc in ipairs(targetModel:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			collisionSave[desc] = desc.CanCollide
+			desc.CanCollide = false
+			desc.AssemblyLinearVelocity = Vector3.zero
+			desc.AssemblyAngularVelocity = Vector3.zero
+		end
+	end
+
+	targetHumanoid.PlatformStand = true
+	targetHumanoid.AutoRotate = false
+	targetHumanoid.WalkSpeed = 0
+	targetHumanoid.BreakJointsOnDeath = true
+	disableJump(targetHumanoid)
+
+	targetRoot.CFrame = holdPart.CFrame * CFrame.new(0, 0, -0.8)
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = holdPart
+	weld.Part1 = targetRoot
+	weld.Parent = holdPart
+
+	grabbedVictim = {
+		model = targetModel,
+		humanoid = targetHumanoid,
+		root = targetRoot,
+		player = targetPlayer,
+		weld = weld,
+		partCollisions = collisionSave,
+		saved = saved,
+	}
+
+	local diedConn
+	diedConn = targetHumanoid.Died:Connect(function()
+		if targetModel and targetModel.Parent and targetModel:GetAttribute("ZombieConverting") == true then
+			if targetRoot and targetRoot.Parent then
+				targetRoot.Anchored = false
+				targetRoot.AssemblyLinearVelocity = Vector3.zero
+				targetRoot.AssemblyAngularVelocity = Vector3.zero
+			end
+			prepareCorpseForCleanup(targetModel)
+			targetModel:SetAttribute("ZombieGrabLocked", true)
+			return
+		end
+
+		releaseVictim(false)
+		if diedConn then
+			pcall(function()
+				diedConn:Disconnect()
+			end)
+		end
+		victimDeathConnections[targetModel] = nil
+	end)
+
+	grabbedVictim.diedConn = diedConn
+	victimDeathConnections[targetModel] = diedConn
+
+	local projectedHealth = targetHumanoid.Health - ATTACK_DAMAGE
+	if targetHumanoid.Health <= CONVERT_CHECK_THRESHOLD or projectedHealth <= CONVERT_CHECK_THRESHOLD then
+		releaseVictim(true)
+		resetAttackState()
+		clearCurrentTarget()
+		state = "Idle"
+		setSpeed(0)
+		playConversionSequence(targetModel, targetHumanoid)
+	else
+		targetHumanoid:TakeDamage(ATTACK_DAMAGE)
+	end
+
+	return true
+end
+
+local function queueZombieRespawn(returnCFrame, waitForConversion)
+	if zombieRespawnQueued then
+		return
+	end
+
+	zombieRespawnQueued = true
+	zombieDeathPivot = returnCFrame or ORIGINAL_SPAWN_CFRAME
+	zombieDeathAt = time()
+
+	task.spawn(function()
+		while zombieRespawnQueued do
+			local elapsed = time() - zombieDeathAt
+			local activeConversions = getActiveConversionCount()
+
+			if waitForConversion then
+				if activeConversions == 0 and not grabbedVictim then
+					break
+				end
+			end
+
+			if elapsed >= ZOMBIE_RESPAWN_TIME then
+				break
+			end
+
+			task.wait(0.1)
+		end
+
+		if zombieRespawnQueued then
+			respawnZombieAtCFrame(zombieDeathPivot)
+			zombieRespawnQueued = false
+		end
+	end)
+end
+
+--////////////////////////////////////////////////////////////
+-- TOUCH ATTACKS
+--////////////////////////////////////////////////////////////
+local function tryTouchAttackFromHit(hit)
+	if zombieDead then
+		return
+	end
+
+	if not hit or not hit.Parent then
+		return
+	end
+
+	local model = hit:FindFirstAncestorOfClass("Model")
+	if not model or model == zombie then
+		return
+	end
+
+	if isZombieModel(model) or isConvertingModel(model) then
+		return
+	end
+
+	local targetHumanoid = model:FindFirstChildOfClass("Humanoid")
+	local targetRoot = getModelRoot(model)
+	if not targetHumanoid or not targetRoot or targetHumanoid.Health <= 0 then
+		return
+	end
+
+	if model:GetAttribute("ZombieGrabLocked") == true then
+		return
+	end
+
+	local now = time()
+	local cooldownUntil = touchAttackCooldowns[model]
+	if cooldownUntil and now < cooldownUntil then
+		return
+	end
+	touchAttackCooldowns[model] = now + ATTACK_COOLDOWN
+
+	currentTargetModel = model
+	currentTargetHumanoid = targetHumanoid
+	currentTargetPos = targetRoot.Position
+	currentTargetKind = "touch"
+	currentTargetMemoryUntil = math.max(currentTargetMemoryUntil, now + 2)
+	lastHeardAt = now
+
+	beginGrab(model, targetHumanoid)
+end
+
+local function hookZombieTouchPart(part)
+	if not part or not part:IsA("BasePart") then
+		return
+	end
+
+	if touchConnections[part] then
+		return
+	end
+
+	part.CanTouch = true
+	touchConnections[part] = part.Touched:Connect(tryTouchAttackFromHit)
+end
+
+for _, desc in ipairs(zombie:GetDescendants()) do
+	if desc:IsA("BasePart") then
+		hookZombieTouchPart(desc)
+	end
+end
+
+zombie.DescendantAdded:Connect(function(obj)
+	if obj:IsA("BasePart") then
+		hookZombieTouchPart(obj)
+	end
+end)
+
+--////////////////////////////////////////////////////////////
+-- TARGETING
+--////////////////////////////////////////////////////////////
+local function startLookAround(now)
+	state = "Look"
+	clearCurrentTarget()
+	currentTargetEndsAt = now + LOOK_AROUND_TIME
+	wanderGoal = nil
+	setSpeed(0)
+end
+
+local function startWander(now)
+	state = "Wander"
+	clearCurrentTarget()
+	setSpeed(WALK_SPEED)
+
+	local angle = math.random() * math.pi * 2
+	local dist = math.random(WANDER_MIN_DISTANCE, WANDER_MAX_DISTANCE)
+	local offset = Vector3.new(math.cos(angle) * dist, 0, math.sin(angle) * dist)
+
+	wanderGoal = root.Position + offset
+	currentTargetPos = wanderGoal
+end
+
+local function beginIdleWait(now)
+	state = "Idle"
+	setSpeed(0)
+	wanderGoal = nil
+	currentTargetPos = nil
+	nextWanderAt = now + math.random(WANDER_MIN_WAIT, WANDER_MAX_WAIT)
+end
+
+local function tryAttackCurrentTarget()
+	if not currentTargetHumanoid or not currentTargetModel then
+		return false
+	end
+
+	if isZombieModel(currentTargetModel) or isConvertingModel(currentTargetModel) then
+		return false
+	end
+
+	if currentTargetModel:GetAttribute("ZombieGrabLocked") == true then
+		return false
+	end
+
+	local targetRoot = getModelRoot(currentTargetModel)
+	if not targetRoot then
+		return false
+	end
+
+	local dist = (root.Position - targetRoot.Position).Magnitude
+	if dist > ATTACK_RANGE then
+		return false
+	end
+
+	return beginGrab(currentTargetModel, currentTargetHumanoid)
+end
+
+local function pullBestZombieSenseEvent()
+	local ev = ZombieSense.PullBestEvent(zombie)
+	if not ev then
+		return nil
+	end
+
+	local dist = ev.dist
+	if dist == nil and ev.pos then
+		dist = (root.Position - ev.pos).Magnitude
+	end
+
+	if not dist then
+		return nil
+	end
+
+	if dist > (ev.alertRadius or math.huge) then
+		return nil
+	end
+
+	return ev
+end
+
+--////////////////////////////////////////////////////////////
+-- DEATH
+--////////////////////////////////////////////////////////////
+humanoid.Died:Connect(function()
+	zombieDead = true
+	zombieDeathPivot = zombie:GetPivot()
+	zombieDeathAt = time()
+
+	ZombieSense.UnregisterZombie(zombie)
+
+	if zombie:GetAttribute("ConvertedZombie") == true or zombie:GetAttribute("ConvertedPlayerZombie") == true then
+		prepareCorpseForCleanup(zombie)
+		cleanupCorpseAfter(zombie, CONVERTED_CORPSE_CLEANUP_TIME)
+		return
+	end
+
+	if grabbedVictim and grabbedVictim.model and grabbedVictim.humanoid then
+		local g = grabbedVictim
+		releaseVictim(true)
+		playConversionSequence(g.model, g.humanoid)
+	end
+
+	local waitForConversion = (getActiveConversionCount() > 0) or (grabbedVictim ~= nil)
+	queueZombieRespawn(zombieDeathPivot, waitForConversion)
+
+	math.randomseed(tick())
+	clearParts(zombie, CONVERTING_CORPSE_CLEANUP_TIME)
+end)
+
+--////////////////////////////////////////////////////////////
+-- MAIN LOOP
+--////////////////////////////////////////////////////////////
+humanoid.WalkSpeed = WALK_SPEED
+humanoid.AutoRotate = true
+nextWanderAt = time() + math.random(WANDER_MIN_WAIT, WANDER_MAX_WAIT)
+
+while zombie.Parent do
+	local now = time()
+
+	if zombieDead then
+		if movementAnimController then
+			movementAnimController:setState("Idle")
+		end
+		task.wait(0.2)
+	else
+		if attacking and now >= attackEndsAt then
+			resetAttackState()
+		end
+
+		if grabbedVictim then
+			state = "Attack"
+		end
+
+		if not grabbedVictim then
+			local bestEvent = pullBestZombieSenseEvent()
+
+			if bestEvent then
+				currentTargetPos = bestEvent.pos
+				currentTargetModel = bestEvent.model
+				currentTargetHumanoid = bestEvent.humanoid
+				currentTargetKind = bestEvent.kind
+				currentTargetMemoryUntil = math.max(currentTargetMemoryUntil, bestEvent.memoryUntil or now)
+				lastHeardAt = now
+				wanderGoal = nil
+
+				if bestEvent.isTrigger or (bestEvent.dist and bestEvent.triggerRadius and bestEvent.dist <= bestEvent.triggerRadius) then
+					state = "Run"
+					setSpeed(RUN_SPEED)
+				else
+					state = "Alert"
+					setSpeed(ALERT_SPEED)
+				end
+			elseif now > currentTargetMemoryUntil then
+				if state ~= "Idle" then
+					beginIdleWait(now)
+				elseif now >= nextWanderAt then
+					startWander(now)
+				end
+			end
+		end
+
+		if state == "Attack" then
+			setSpeed(0)
+			humanoid:MoveTo(root.Position)
+
+			if now >= attackEndsAt then
+				releaseVictim(false)
+				attacking = false
+
+				if currentTargetModel and currentTargetModel.Parent and currentTargetHumanoid and currentTargetHumanoid.Health > 0 then
+					local dist = currentTargetPos and (root.Position - currentTargetPos).Magnitude or math.huge
+					if dist <= 12 then
+						state = "Run"
+						setSpeed(RUN_SPEED)
+					else
+						state = "Alert"
+						setSpeed(ALERT_SPEED)
+					end
+				else
+					beginIdleWait(now)
+				end
+			end
+
+		elseif state == "Run" or state == "Alert" then
+			if currentTargetPos then
+				humanoid:MoveTo(currentTargetPos)
+
+				local distToTarget = (root.Position - currentTargetPos).Magnitude
+				local sourceStillFresh = (now - lastHeardAt) <= 1.5
+
+				if not grabbedVictim then
+					if currentTargetHumanoid and currentTargetHumanoid.Health > 0 and distToTarget <= ATTACK_RANGE then
+						if tryAttackCurrentTarget() then
+							task.wait(0.05)
+							if movementAnimController then
+								movementAnimController:setState(state)
+							end
+							task.wait(0.15)
+							continue
+						end
+					end
+				end
+
+				if distToTarget <= ARRIVE_DISTANCE and not sourceStillFresh and now > currentTargetMemoryUntil then
+					startLookAround(now)
+				end
+			else
+				if now > currentTargetMemoryUntil then
+					beginIdleWait(now)
+				end
+			end
+
+			if state == "Run" and now >= currentTargetMemoryUntil then
+				state = "Alert"
+				setSpeed(ALERT_SPEED)
+			end
+
+		elseif state == "Look" then
+			setSpeed(0)
+			humanoid:MoveTo(root.Position)
+
+			if now >= currentTargetEndsAt then
+				beginIdleWait(now)
+			end
+
+		elseif state == "Wander" then
+			setSpeed(WALK_SPEED)
+
+			if wanderGoal then
+				humanoid:MoveTo(wanderGoal)
+
+				local reached = (root.Position - wanderGoal).Magnitude <= ARRIVE_DISTANCE
+				if reached then
+					beginIdleWait(now)
+				end
+			else
+				beginIdleWait(now)
+			end
+		end
+
+		if movementAnimController then
+			movementAnimController:setState(state)
+		end
+
+		task.wait(0.2)
+	end
+end

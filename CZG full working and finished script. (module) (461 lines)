@@ -1,0 +1,461 @@
+-- ZombieSenseService.lua
+-- Put this ModuleScript in ServerScriptService.
+-- This version fixes overextended sound detection by keeping range tied
+-- to actual sound falloff more tightly, and by expiring old events.
+
+local Workspace = game:GetService("Workspace")
+
+local ZombieSense = {}
+
+local SCAN_INTERVAL = 0.20
+local DEFAULT_SOUND_DISTANCE = 60
+
+local SOUND_TRIGGER_RATIO = 0.45
+local SOUND_ALERT_RATIO = 1.00
+
+local RUN_VIB_TRIGGER_RADIUS = 15
+local RUN_VIB_ALERT_RADIUS = 35
+local AIR_VIB_TRIGGER_RADIUS = 30
+local AIR_VIB_ALERT_RADIUS = 50
+local HEAVY_FALL_MULTIPLIER = 2
+
+local EVENT_TTL = 2.5
+
+local trackedZombies = {}    -- [Model] = {model, root, humanoid}
+local trackedSounds = {}     -- [Sound] = true
+local trackedHumanoids = {}   -- [Humanoid] = true
+local humanoidState = {}      -- [Humanoid] = state table
+local zombieMailboxes = {}   -- [Model] = array of events
+
+local initialized = false
+
+local function isZombieModel(model)
+	if not model then
+		return false
+	end
+
+	return model:GetAttribute("IsZombie") == true
+		or model:GetAttribute("ConvertedZombie") == true
+		or model:GetAttribute("ConvertedPlayerZombie") == true
+end
+
+local function isConvertingModel(model)
+	return model and model:GetAttribute("ZombieConverting") == true
+end
+
+local function getModelRoot(model)
+	if not model then
+		return nil
+	end
+
+	return model.PrimaryPart
+		or model:FindFirstChild("HumanoidRootPart")
+		or model:FindFirstChild("Torso")
+		or model:FindFirstChild("UpperTorso")
+		or model:FindFirstChildWhichIsA("BasePart")
+end
+
+local function getPositionFromObject(obj)
+	if not obj then
+		return nil
+	end
+
+	if obj:IsA("BasePart") then
+		return obj.Position
+	elseif obj:IsA("Attachment") then
+		return obj.WorldPosition
+	elseif obj:IsA("Model") then
+		local root = getModelRoot(obj)
+		if root then
+			return root.Position
+		end
+	elseif obj:IsA("Tool") then
+		local handle = obj:FindFirstChild("Handle")
+		if handle and handle:IsA("BasePart") then
+			return handle.Position
+		end
+	end
+
+	return nil
+end
+
+local function ensureMailbox(model)
+	local box = zombieMailboxes[model]
+	if not box then
+		box = {}
+		zombieMailboxes[model] = box
+	end
+	return box
+end
+
+local function cleanupZombie(model)
+	trackedZombies[model] = nil
+	zombieMailboxes[model] = nil
+end
+
+local function registerZombieInternal(model)
+	if not model or not model:IsA("Model") then
+		return
+	end
+	if trackedZombies[model] then
+		return
+	end
+
+	local root = getModelRoot(model)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if not root or not humanoid then
+		return
+	end
+
+	trackedZombies[model] = {
+		model = model,
+		root = root,
+		humanoid = humanoid,
+	}
+
+	ensureMailbox(model)
+
+	model.AncestryChanged:Connect(function()
+		if not model:IsDescendantOf(Workspace) then
+			cleanupZombie(model)
+		end
+	end)
+end
+
+local function registerSound(sound)
+	if not sound or not sound:IsA("Sound") then
+		return
+	end
+	trackedSounds[sound] = true
+
+	sound.AncestryChanged:Connect(function()
+		if not sound:IsDescendantOf(Workspace) then
+			trackedSounds[sound] = nil
+		end
+	end)
+end
+
+local function registerHumanoid(humanoid)
+	if not humanoid or not humanoid:IsA("Humanoid") then
+		return
+	end
+	trackedHumanoids[humanoid] = true
+
+	humanoid.AncestryChanged:Connect(function()
+		if not humanoid:IsDescendantOf(Workspace) then
+			trackedHumanoids[humanoid] = nil
+			humanoidState[humanoid] = nil
+		end
+	end)
+end
+
+local function pushEventToNearbyZombies(event)
+	if not event or not event.pos then
+		return
+	end
+
+	local pos = event.pos
+	local alertRadius = event.alertRadius or 0
+	local triggerRadius = event.triggerRadius or 0
+	local expiresAt = event.expiresAt or (time() + EVENT_TTL)
+
+	for zombieModel, zombieInfo in pairs(trackedZombies) do
+		if zombieModel and zombieModel.Parent and zombieInfo and zombieInfo.root and zombieInfo.root.Parent then
+			local dist = (zombieInfo.root.Position - pos).Magnitude
+			if dist <= alertRadius then
+				local mailbox = ensureMailbox(zombieModel)
+				mailbox[#mailbox + 1] = {
+					pos = pos,
+					dist = dist,
+					score = event.score or 0,
+					triggerRadius = triggerRadius,
+					alertRadius = alertRadius,
+					memoryUntil = event.memoryUntil or 0,
+					expiresAt = expiresAt,
+					kind = event.kind,
+					model = event.model,
+					humanoid = event.humanoid,
+					isTrigger = dist <= triggerRadius,
+				}
+			end
+		end
+	end
+end
+
+local function buildSoundEvent(sound)
+	if not sound or not sound.Parent or not sound:IsDescendantOf(Workspace) then
+		return nil
+	end
+	if sound.Playing ~= true then
+		return nil
+	end
+
+	local obj = sound.Parent
+	local pos
+	while obj do
+		pos = getPositionFromObject(obj)
+		if pos then
+			break
+		end
+		obj = obj.Parent
+	end
+	if not pos then
+		return nil
+	end
+
+	local sourceModel = sound:FindFirstAncestorWhichIsA("Model")
+	if sourceModel and (isZombieModel(sourceModel) or isConvertingModel(sourceModel)) then
+		return nil
+	end
+
+	local maxDistance = sound.RollOffMaxDistance
+	if typeof(maxDistance) ~= "number" or maxDistance <= 0 then
+		maxDistance = DEFAULT_SOUND_DISTANCE
+	end
+
+	-- Keep the spatial radius close to the actual sound falloff.
+	-- Volume affects priority a little, but does not massively extend range.
+	local volume = sound.Volume
+	if typeof(volume) ~= "number" then
+		volume = 1
+	end
+
+	local volumeBoost = math.clamp((volume - 1) * 0.12, -0.05, 0.15)
+	local audibleDist = math.clamp(maxDistance * (1 + volumeBoost), 12, 180)
+
+	local triggerRadius = math.clamp(math.floor(audibleDist * SOUND_TRIGGER_RATIO), 8, math.max(8, audibleDist - 2))
+	local alertRadius = math.max(triggerRadius + 1, math.floor(audibleDist * SOUND_ALERT_RATIO))
+
+	local name = string.lower(sound.Name or "")
+	local score = (audibleDist - triggerRadius) * 0.5 + (math.clamp(volume, 0, 2) * 4)
+
+	if name:find("gun") or name:find("shoot") or name:find("boom") or name:find("blast") or name:find("explosion") then
+		score += 30
+	end
+	if name:find("run") or name:find("walk") or name:find("step") or name:find("jump") or name:find("fall") or name:find("land") then
+		score += 10
+	end
+
+	local memoryUntil = time() + 2.5
+	if audibleDist >= 80 or score >= 70 then
+		memoryUntil = time() + 45
+	end
+
+	return {
+		pos = pos,
+		score = score,
+		triggerRadius = triggerRadius,
+		alertRadius = alertRadius,
+		memoryUntil = memoryUntil,
+		expiresAt = time() + EVENT_TTL,
+		kind = "sound",
+		model = sourceModel,
+		humanoid = sourceModel and sourceModel:FindFirstChildOfClass("Humanoid") or nil,
+	}
+end
+
+local function scanHumanoidForVibration(humanoid)
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	local model = humanoid.Parent
+	if not model or not model:IsA("Model") then
+		return
+	end
+
+	if isZombieModel(model) or isConvertingModel(model) then
+		return
+	end
+
+	local root = getModelRoot(model)
+	if not root then
+		return
+	end
+
+	local now = time()
+	local stateData = humanoidState[humanoid]
+	if not stateData then
+		stateData = {
+			wasAirborne = false,
+			lastYVelocity = 0,
+			lastJumpEvent = 0,
+			lastRunEvent = 0,
+			lastLandingEvent = 0,
+		}
+		humanoidState[humanoid] = stateData
+	end
+
+	local pos = root.Position
+	local vel = root.AssemblyLinearVelocity
+	local horizontalSpeed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+
+	local inAir = humanoid.FloorMaterial == Enum.Material.Air
+		or humanoid:GetState() == Enum.HumanoidStateType.Freefall
+		or humanoid:GetState() == Enum.HumanoidStateType.Jumping
+
+	if horizontalSpeed >= 14 and (now - stateData.lastRunEvent) >= 0.15 then
+		pushEventToNearbyZombies({
+			pos = pos,
+			score = 40 + horizontalSpeed,
+			triggerRadius = RUN_VIB_TRIGGER_RADIUS,
+			alertRadius = RUN_VIB_ALERT_RADIUS,
+			memoryUntil = now + 1.5,
+			expiresAt = now + EVENT_TTL,
+			kind = "run",
+			model = model,
+			humanoid = humanoid,
+		})
+		stateData.lastRunEvent = now
+	end
+
+	if inAir and (now - stateData.lastJumpEvent) >= 0.2 then
+		pushEventToNearbyZombies({
+			pos = pos,
+			score = 20 + math.abs(vel.Y),
+			triggerRadius = AIR_VIB_TRIGGER_RADIUS,
+			alertRadius = AIR_VIB_ALERT_RADIUS,
+			memoryUntil = now + 1.5,
+			expiresAt = now + EVENT_TTL,
+			kind = "air",
+			model = model,
+			humanoid = humanoid,
+		})
+		stateData.lastJumpEvent = now
+		stateData.wasAirborne = true
+		stateData.lastYVelocity = vel.Y
+	end
+
+	if stateData.wasAirborne and not inAir then
+		local impact = math.abs(stateData.lastYVelocity or 0)
+		local triggerRadius = AIR_VIB_TRIGGER_RADIUS
+		local alertRadius = AIR_VIB_ALERT_RADIUS
+
+		if impact >= 120 then
+			triggerRadius = math.max(30, math.floor(impact * HEAVY_FALL_MULTIPLIER))
+			alertRadius = math.max(50, triggerRadius + 20)
+		end
+
+		if (now - stateData.lastLandingEvent) >= 0.25 then
+			pushEventToNearbyZombies({
+				pos = pos,
+				score = 50 + impact,
+				triggerRadius = triggerRadius,
+				alertRadius = alertRadius,
+				memoryUntil = now + 2,
+				expiresAt = now + EVENT_TTL,
+				kind = "land",
+				model = model,
+				humanoid = humanoid,
+			})
+			stateData.lastLandingEvent = now
+		end
+
+		stateData.wasAirborne = false
+	end
+
+	stateData.lastYVelocity = vel.Y
+end
+
+local function rebuildInitialIndexes()
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		if obj:IsA("Sound") then
+			registerSound(obj)
+		elseif obj:IsA("Humanoid") then
+			registerHumanoid(obj)
+		end
+	end
+end
+
+local function init()
+	if initialized then
+		return
+	end
+	initialized = true
+
+	Workspace.DescendantAdded:Connect(function(obj)
+		if obj:IsA("Sound") then
+			registerSound(obj)
+		elseif obj:IsA("Humanoid") then
+			registerHumanoid(obj)
+		end
+	end)
+
+	rebuildInitialIndexes()
+
+	task.spawn(function()
+		while true do
+			pcall(function()
+				for sound in pairs(trackedSounds) do
+					if not sound or not sound.Parent or not sound:IsDescendantOf(Workspace) then
+						trackedSounds[sound] = nil
+					else
+						local ev = buildSoundEvent(sound)
+						if ev then
+							pushEventToNearbyZombies(ev)
+						end
+					end
+				end
+
+				for humanoid in pairs(trackedHumanoids) do
+					if not humanoid or not humanoid.Parent or humanoid.Health <= 0 then
+						trackedHumanoids[humanoid] = nil
+						humanoidState[humanoid] = nil
+					else
+						scanHumanoidForVibration(humanoid)
+					end
+				end
+			end)
+
+			task.wait(SCAN_INTERVAL)
+		end
+	end)
+end
+
+function ZombieSense.RegisterZombie(model)
+	init()
+	registerZombieInternal(model)
+end
+
+function ZombieSense.UnregisterZombie(model)
+	cleanupZombie(model)
+end
+
+function ZombieSense.PullBestEvent(model)
+	init()
+
+	local mailbox = zombieMailboxes[model]
+	if not mailbox or #mailbox == 0 then
+		return nil
+	end
+
+	local now = time()
+	local filtered = {}
+	for _, ev in ipairs(mailbox) do
+		if ev and ev.expiresAt and ev.expiresAt >= now then
+			filtered[#filtered + 1] = ev
+		end
+	end
+
+	zombieMailboxes[model] = {}
+
+	if #filtered == 0 then
+		return nil
+	end
+
+	table.sort(filtered, function(a, b)
+		if a.isTrigger ~= b.isTrigger then
+			return a.isTrigger == true
+		end
+		if (a.score or 0) == (b.score or 0) then
+			return (a.dist or math.huge) < (b.dist or math.huge)
+		end
+		return (a.score or 0) > (b.score or 0)
+	end)
+
+	return filtered[1]
+end
+
+init()
+
+return ZombieSense

@@ -1,0 +1,72 @@
+-- Script inside ServerScriptService
+
+local Players = game:GetService("Players")
+
+local function paintDarkGreen(model)
+	for _, obj in ipairs(model:GetDescendants()) do
+		if obj:IsA("BasePart") then
+			obj.Color = Color3.fromRGB(0, 100, 0)
+		end
+	end
+end
+
+local function copyHumanoidScales(sourceHumanoid, targetHumanoid)
+	local scaleNames = {
+		"BodyDepthScale",
+		"BodyHeightScale",
+		"BodyWidthScale",
+		"BodyProportionScale",
+		"BodyTypeScale",
+		"HeadScale",
+	}
+
+	for _, scaleName in ipairs(scaleNames) do
+		local sourceScale = sourceHumanoid:FindFirstChild(scaleName)
+		local targetScale = targetHumanoid:FindFirstChild(scaleName)
+
+		if sourceScale and targetScale and sourceScale:IsA("NumberValue") and targetScale:IsA("NumberValue") then
+			targetScale.Value = sourceScale.Value
+		end
+	end
+
+	targetHumanoid.AutomaticScalingEnabled = sourceHumanoid.AutomaticScalingEnabled
+end
+
+local function cloneCharacter(player)
+	local character = player.Character
+	if not character then return end
+
+	local oldArchivable = character.Archivable
+	character.Archivable = true
+
+	local clone = character:Clone()
+
+	character.Archivable = oldArchivable
+	if not clone then return end
+
+	clone.Name = player.Name .. "_Clone"
+
+	local originalHumanoid = character:FindFirstChildOfClass("Humanoid")
+	local cloneHumanoid = clone:FindFirstChildOfClass("Humanoid")
+	if originalHumanoid and cloneHumanoid then
+		copyHumanoidScales(originalHumanoid, cloneHumanoid)
+	end
+
+	local originalRoot = character:FindFirstChild("HumanoidRootPart")
+	if originalRoot then
+		clone:PivotTo(originalRoot.CFrame * CFrame.new(4, 0, 0))
+	end
+
+	paintDarkGreen(clone)
+
+	-- Keep all character scripts intact.
+	clone.Parent = workspace
+end
+
+Players.PlayerAdded:Connect(function(player)
+	player.Chatted:Connect(function(message)
+		if message:lower() == "/clone" then
+			cloneCharacter(player)
+		end
+	end)
+end)

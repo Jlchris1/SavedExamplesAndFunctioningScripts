@@ -1,0 +1,164 @@
+-- ServerScriptService/TornadoSpawner.server.lua
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local MESH_ID = "rbxassetid://106996128100973"
+
+local MOVE_SPEED = 3
+local FORM_TIME = 45
+local DESPAWN_HEIGHT = 750
+
+local SEGMENT_HEIGHT = 5
+local SEGMENT_COUNT = math.floor(DESPAWN_HEIGHT / SEGMENT_HEIGHT)
+
+local MAX_SIDE_LEAN = 50
+local spawned = false
+
+local function getSpawnPosition()
+	local spawn = workspace:FindFirstChildWhichIsA("SpawnLocation")
+	if spawn then
+		return spawn.Position + Vector3.new(0, 6, 0)
+	end
+	return Vector3.new(0, 6, 0)
+end
+
+local function createSegment(parent: Instance)
+	local part = Instance.new("Part")
+	part.Name = "TornadoPiece"
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.Material = Enum.Material.SmoothPlastic
+	part.Color = Color3.fromRGB(60, 60, 60)
+	part.Transparency = 0
+	part.Size = Vector3.new(1, 1, 1)
+	part.Parent = parent
+
+	local mesh = Instance.new("SpecialMesh")
+	mesh.MeshType = Enum.MeshType.FileMesh
+	mesh.MeshId = MESH_ID
+	mesh.Scale = Vector3.new(0.35, 5, 0.35)
+	mesh.Parent = part
+
+	return part, mesh
+end
+
+local function spawnTornado(origin: Vector3)
+	local model = Instance.new("Model")
+	model.Name = "RopeTornado"
+	model.Parent = workspace
+
+	local root = Instance.new("Part")
+	root.Name = "Root"
+	root.Anchored = true
+	root.Transparency = 1
+	root.CanCollide = false
+	root.CanTouch = false
+	root.CanQuery = false
+	root.Size = Vector3.new(1, 1, 1)
+	root.Position = origin
+	root.Parent = model
+
+	local segments = {}
+	for i = 1, SEGMENT_COUNT do
+		local part, mesh = createSegment(model)
+		segments[i] = {
+			part = part,
+			mesh = mesh,
+		}
+	end
+
+	local startTime = os.clock()
+	local noiseSeed = math.random(1, 100000)
+
+	local conn
+	conn = RunService.Heartbeat:Connect(function(dt)
+		if not model.Parent then
+			conn:Disconnect()
+			return
+		end
+
+		local t = os.clock() - startTime
+		local formAlpha = math.clamp(t / FORM_TIME, 0, 1)
+
+		-- Main tornado drift.
+		local nx = math.noise(noiseSeed, t * 0.10, 0)
+		local nz = math.noise(noiseSeed, 0, t * 0.10)
+		local moveDir = Vector3.new(nx, 0, nz)
+
+		if moveDir.Magnitude < 0.05 then
+			moveDir = Vector3.new(1, 0, 0)
+		else
+			moveDir = moveDir.Unit
+		end
+
+		root.Position += moveDir * MOVE_SPEED * dt
+
+		-- Build the column by connecting each segment edge-to-edge.
+		local cursor = root.Position
+
+		for i = 1, SEGMENT_COUNT do
+			local h = (i - 1) / (SEGMENT_COUNT - 1)
+
+			-- Bottom moves the most, top leans left more.
+			local bottomWobble = (1 - h) ^ 1.6
+			local topLean = -MAX_SIDE_LEAN * (h ^ 1.15)
+
+			local wiggleX =
+				math.noise(noiseSeed, t * 2.1, h * 6.5) * 7 * bottomWobble
+				+ math.sin(t * 4.2 + h * 13 + noiseSeed * 0.01) * 3.5 * bottomWobble
+
+			local wiggleZ =
+				math.noise(noiseSeed, h * 4.2, t * 1.8) * 5 * bottomWobble
+				+ math.cos(t * 3.3 + h * 10 + noiseSeed * 0.02) * 2.8 * bottomWobble
+
+			-- Tilt like / or \, but keep it connected by advancing from the tilted edge.
+			local tiltDeg =
+				-18
+				- (22 * h)
+				+ math.sin(t * 3.2 + h * 12 + noiseSeed * 0.01) * 8
+
+			local tilt = math.rad(tiltDeg)
+
+			-- This vector is the segment's local "up" direction after tilt.
+			-- It makes the next piece start at the upper edge of this one.
+			local step = Vector3.new(
+				-math.sin(tilt) * SEGMENT_HEIGHT,
+				math.cos(tilt) * SEGMENT_HEIGHT,
+				0
+			)
+
+			-- Add extra weirdness while still keeping the chain joined.
+			local wobbleStep = Vector3.new(
+				wiggleX * 0.03,
+				0,
+				wiggleZ * 0.03
+			)
+
+			local center = cursor + (step * 0.5) + Vector3.new(topLean + wiggleX, 0, wiggleZ)
+			segments[i].part.CFrame = CFrame.new(center) * CFrame.Angles(0, 0, tilt)
+
+			local shade = math.clamp(60 + h * 20, 50, 90)
+			segments[i].part.Color = Color3.fromRGB(shade, shade, shade)
+			segments[i].part.Transparency = 0
+
+			local width = 0.3 + (h * 0.35)
+			segments[i].mesh.Scale = Vector3.new(width, 5, width)
+
+			-- Advance to the next segment from this one's upper edge.
+			cursor = cursor + step + wobbleStep
+		end
+	end)
+end
+
+Players.PlayerAdded:Connect(function()
+	if spawned then
+		return
+	end
+	spawned = true
+
+	task.wait(1)
+	spawnTornado(getSpawnPosition())
+end)

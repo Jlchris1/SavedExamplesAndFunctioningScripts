@@ -1,0 +1,2211 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local Debris = game:GetService("Debris")
+
+local CONFIG = {
+	SpawnMinInterval = 60,
+	SpawnMaxInterval = 45 * 60,
+	SpawnAverageInterval = 420,
+
+	FunnelHeight = 7500,
+	HugeFunnelHeight = 7500,
+
+	MinSegments = 180,
+	MaxSegments = 260,
+	HugeMinSegments = 40,
+	HugeMaxSegments = 70,
+
+	MinLowWidth = 10,
+	MaxLowWidth = 10000,
+	AverageLowWidth = 40,
+
+	MinTopWidth = 100,
+	MaxTopWidth = 10000,
+
+	AverageWindField = 200,
+	AverageMoveSpeed = 9,
+	AverageLiftUp = 80,
+
+	TouchdownDuration = 40,
+	DefaultLifetime = 420,
+
+	TestStormJoinWindow = 60,
+	TestStormSpawnDelayMin = 20,
+	TestStormSpawnDelayMax = 60,
+
+	DestroyThrownPartDelay = 5,
+
+	HorizontalVortexInterval = 45,
+	HorizontalVortexMinLifetime = 20,
+	HorizontalVortexMaxLifetime = 45,
+	HorizontalVortexMinLength = 500,
+	HorizontalVortexMaxLength = 1000,
+	HorizontalVortexMinWind = 60,
+	HorizontalVortexMaxWind = 120,
+
+	TopPlateParticleRate = 250,
+	TopPlateParticleSize = 100,
+
+	SpawnMinWideSize = 1000,
+	SpawnMinThickness = 0.001,
+
+	CloudCoverageBaseRadius = 10000,
+	CloudCoverageMaxRadius = 25000,
+	CloudGridRadius = 13,
+	CloudGridSpacing = 2000,
+}
+
+local WORLD_UP = Vector3.new(0, 1, 0)
+
+local TORNADO_FOLDER = Workspace:FindFirstChild("NaturalTornadoes")
+if not TORNADO_FOLDER then
+	TORNADO_FOLDER = Instance.new("Folder")
+	TORNADO_FOLDER.Name = "NaturalTornadoes"
+	TORNADO_FOLDER.Parent = Workspace
+end
+
+local BLOOD_FOLDER = Workspace:FindFirstChild("FakeBlood")
+if not BLOOD_FOLDER then
+	BLOOD_FOLDER = Instance.new("Folder")
+	BLOOD_FOLDER.Name = "FakeBlood"
+	BLOOD_FOLDER.Parent = Workspace
+end
+
+local WIND_MAX_CHARACTER_SPEED = 220
+local WIND_MAX_OBJECT_SPEED = 220
+
+local GROUND_RAY_HEIGHT = 1200
+local GROUND_RAY_DEPTH = 9000
+local GROUND_MAX_STEP = 28
+
+local FALL_DAMAGE_LIFETIME = 10
+local FALL_DAMAGE_GROUND_BUFFER = 3.5
+
+local spawned = false
+local testStormQueued = false
+
+local pendingFallDamage = {}
+local ragdolledModels = {}
+local frozenCharacters = {}
+local deathConnections = {}
+local activeStorms = {}
+local stormIdCounter = 0
+
+local function safeUnit(v)
+	if v.Magnitude < 0.001 then
+		return Vector3.zero
+	end
+	return v.Unit
+end
+
+local function clampVectorMagnitude(v, maxMag)
+	local mag = v.Magnitude
+	if mag <= maxMag then
+		return v
+	end
+	if mag < 0.001 then
+		return Vector3.zero
+	end
+	return v.Unit * maxMag
+end
+
+local function randomFlatDirection(rng)
+	local a = rng:NextNumber(0, math.pi * 2)
+	return Vector3.new(math.cos(a), 0, math.sin(a))
+end
+
+local function randomSphereDirection(rng)
+	local dir = Vector3.new(
+		rng:NextNumber(-1, 1),
+		rng:NextNumber(-1, 1),
+		rng:NextNumber(-1, 1)
+	)
+	if dir.Magnitude < 0.001 then
+		return Vector3.new(0, 1, 0)
+	end
+	return dir.Unit
+end
+
+local function projectOntoPlane(v, normal)
+	return v - normal * v:Dot(normal)
+end
+
+local function buildOrbitBasis(axisDir, previousBasis1, referenceVector)
+	local axis = safeUnit(axisDir)
+	if axis == Vector3.zero then
+		axis = WORLD_UP
+	end
+
+	local basis1 = Vector3.zero
+	if previousBasis1 then
+		basis1 = projectOntoPlane(previousBasis1, axis)
+	end
+
+	if basis1.Magnitude < 0.001 then
+		basis1 = projectOntoPlane(referenceVector, axis)
+	end
+
+	if basis1.Magnitude < 0.001 then
+		local helper = Vector3.new(1, 0, 0)
+		if math.abs(axis:Dot(helper)) > 0.92 then
+			helper = Vector3.new(0, 0, 1)
+		end
+		basis1 = helper:Cross(axis)
+	end
+
+	if basis1.Magnitude < 0.001 then
+		basis1 = Vector3.new(0, 1, 0):Cross(axis)
+	end
+
+	if basis1.Magnitude < 0.001 then
+		basis1 = Vector3.new(1, 0, 0)
+	end
+
+	basis1 = basis1.Unit
+
+	local basis2 = axis:Cross(basis1)
+	if basis2.Magnitude < 0.001 then
+		basis2 = Vector3.new(0, 0, 1)
+	end
+	basis2 = basis2.Unit
+
+	return basis1, basis2
+end
+
+local function frameFromDirection(pos, upDir)
+	local up = safeUnit(upDir)
+	if up == Vector3.zero then
+		up = WORLD_UP
+	end
+
+	local helper = Vector3.new(1, 0, 0)
+	if math.abs(up:Dot(helper)) > 0.92 then
+		helper = Vector3.new(0, 0, 1)
+	end
+
+	local right = helper:Cross(up)
+	if right.Magnitude < 0.001 then
+		helper = Vector3.new(0, 0, 1)
+		right = helper:Cross(up)
+	end
+
+	right = right.Unit
+	local back = right:Cross(up).Unit
+	return CFrame.fromMatrix(pos, right, up, back)
+end
+
+local function isInsideWhitelistedFolder(inst)
+	local current = inst
+	while current do
+		if current:IsA("Folder") and current.Name == "Whitelisted" then
+			return true
+		end
+		current = current.Parent
+	end
+	return false
+end
+
+local function isMassiveStructurePart(part)
+	local s = part.Size
+	local dims = { s.X, s.Y, s.Z }
+	table.sort(dims)
+	return dims[3] >= 1500 and dims[1] <= 1 and dims[2] >= 750
+end
+
+local function shouldIgnoreWindPart(part)
+	if not part or not part.Parent then
+		return true
+	end
+	if part:IsDescendantOf(TORNADO_FOLDER) then
+		return true
+	end
+	if part:IsDescendantOf(BLOOD_FOLDER) then
+		return true
+	end
+	if isInsideWhitelistedFolder(part) then
+		return true
+	end
+	if isMassiveStructurePart(part) then
+		return true
+	end
+	return false
+end
+
+local function getCharacterModelFromRoot(rootPart)
+	local model = rootPart:FindFirstAncestorOfClass("Model")
+	if not model then
+		return nil, nil
+	end
+
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		return model, humanoid
+	end
+
+	return model, nil
+end
+
+local function getGroundYAtPosition(pos, modelToIgnore)
+	local rayOrigin = Vector3.new(pos.X, pos.Y + GROUND_RAY_HEIGHT, pos.Z)
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Blacklist
+	params.IgnoreWater = true
+
+	local blacklist = { TORNADO_FOLDER, BLOOD_FOLDER }
+	if modelToIgnore then
+		table.insert(blacklist, modelToIgnore)
+	end
+	params.FilterDescendantsInstances = blacklist
+
+	local result = Workspace:Raycast(rayOrigin, Vector3.new(0, -GROUND_RAY_DEPTH, 0), params)
+	if result and result.Position then
+		return result.Position.Y, result.Instance
+	end
+
+	return nil, nil
+end
+
+local function setCharacterTornadoFreeze(characterModel, humanoid, enabled)
+	if not characterModel or not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	if enabled then
+		if frozenCharacters[characterModel] then
+			return
+		end
+
+		frozenCharacters[characterModel] = true
+		humanoid.PlatformStand = true
+		humanoid.AutoRotate = false
+
+		pcall(function()
+			humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+		end)
+
+		local animate = characterModel:FindFirstChild("Animate")
+		if animate and animate:IsA("LocalScript") then
+			pcall(function()
+				animate.Disabled = true
+			end)
+		end
+	else
+		if not frozenCharacters[characterModel] then
+			return
+		end
+
+		frozenCharacters[characterModel] = nil
+		humanoid.PlatformStand = false
+		humanoid.AutoRotate = true
+
+		pcall(function()
+			humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+		end)
+
+		local animate = characterModel:FindFirstChild("Animate")
+		if animate and animate:IsA("LocalScript") then
+			pcall(function()
+				animate.Disabled = false
+			end)
+		end
+	end
+end
+
+local function ragdollCharacterOnDeath(characterModel)
+	if ragdolledModels[characterModel] then
+		return
+	end
+
+	local humanoid = characterModel:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
+	end
+
+	ragdolledModels[characterModel] = true
+	frozenCharacters[characterModel] = nil
+
+	humanoid.BreakJointsOnDeath = false
+	humanoid.RequiresNeck = false
+	humanoid.AutoRotate = false
+	humanoid.PlatformStand = false
+
+	pcall(function()
+		humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+	end)
+
+	local ragdollFolder = characterModel:FindFirstChild("TornadoRagdollConstraints")
+	if not ragdollFolder then
+		ragdollFolder = Instance.new("Folder")
+		ragdollFolder.Name = "TornadoRagdollConstraints"
+		ragdollFolder.Parent = characterModel
+	end
+
+	for _, inst in ipairs(characterModel:GetDescendants()) do
+		if inst:IsA("BasePart") then
+			inst.CanCollide = inst.Name ~= "HumanoidRootPart"
+			inst.Massless = false
+		end
+	end
+
+	for _, inst in ipairs(characterModel:GetDescendants()) do
+		if inst:IsA("Motor6D") then
+			local part0 = inst.Part0
+			local part1 = inst.Part1
+
+			if part0 and part1 then
+				local att0 = Instance.new("Attachment")
+				att0.Name = "TornadoRagdollAtt0"
+				att0.CFrame = inst.C0
+				att0.Parent = part0
+
+				local att1 = Instance.new("Attachment")
+				att1.Name = "TornadoRagdollAtt1"
+				att1.CFrame = inst.C1
+				att1.Parent = part1
+
+				local socket = Instance.new("BallSocketConstraint")
+				socket.Name = "TornadoRagdollSocket"
+				socket.Attachment0 = att0
+				socket.Attachment1 = att1
+				socket.LimitsEnabled = true
+				socket.TwistLimitsEnabled = true
+				socket.UpperAngle = 45
+				socket.TwistLowerAngle = -45
+				socket.TwistUpperAngle = 45
+				socket.MaxFrictionTorque = 10
+				socket.Parent = ragdollFolder
+			end
+
+			pcall(function()
+				inst.Enabled = false
+			end)
+			inst:Destroy()
+		end
+	end
+end
+
+local function spawnBloodSplatter(position)
+	local folder = Instance.new("Folder")
+	folder.Name = "FakeBlood"
+	folder.Parent = BLOOD_FOLDER
+
+	local rng = Random.new(math.floor(os.clock() * 1000000) % 2147483647)
+
+	for _ = 1, 80 do
+		local p = Instance.new("Part")
+		p.Name = "BloodBrick"
+		p.Size = Vector3.new(1, 0.5, 1)
+		p.Material = Enum.Material.SmoothPlastic
+		p.Color = Color3.fromRGB(170, 0, 0)
+		p.Transparency = rng:NextNumber(0.15, 0.45)
+		p.Anchored = false
+		p.CanCollide = true
+		p.CanTouch = false
+		p.CanQuery = false
+		p.Massless = true
+		p.TopSurface = Enum.SurfaceType.Smooth
+		p.BottomSurface = Enum.SurfaceType.Smooth
+
+		local outward = randomSphereDirection(rng)
+		local spawnOffset = outward * rng:NextNumber(0.25, 2.25)
+
+		p.CFrame =
+			CFrame.new(position + spawnOffset)
+			* CFrame.Angles(
+				rng:NextNumber(0, math.pi * 2),
+				rng:NextNumber(0, math.pi * 2),
+				rng:NextNumber(0, math.pi * 2)
+			)
+
+		p.Parent = folder
+
+		local speed = rng:NextNumber(45, 110)
+		p.AssemblyLinearVelocity = outward * speed + Vector3.new(0, rng:NextNumber(10, 35), 0)
+		p.AssemblyAngularVelocity = Vector3.new(
+			rng:NextNumber(-14, 14),
+			rng:NextNumber(-14, 14),
+			rng:NextNumber(-14, 14)
+		)
+
+		Debris:AddItem(p, 10)
+	end
+
+	Debris:AddItem(folder, 10.15)
+end
+
+local function applyVelocityToCharacter(model, targetVelocity, angularVelocity)
+	local rootPart = model:FindFirstChild("HumanoidRootPart")
+	if rootPart and rootPart:IsA("BasePart") then
+		rootPart.AssemblyLinearVelocity = targetVelocity
+		if angularVelocity then
+			rootPart.AssemblyAngularVelocity = angularVelocity
+		end
+	end
+end
+
+local function applyVelocityToAssembly(rootPart, targetVelocity, angularVelocity)
+	rootPart.AssemblyLinearVelocity = targetVelocity
+	if angularVelocity then
+		rootPart.AssemblyAngularVelocity = angularVelocity
+	end
+end
+
+local function armFallDamage(assemblyRoot, humanoid, characterModel)
+	if not assemblyRoot or not assemblyRoot.Parent then
+		return
+	end
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	local existing = pendingFallDamage[assemblyRoot]
+	local expiresAt = os.clock() + FALL_DAMAGE_LIFETIME
+
+	if existing then
+		existing.humanoid = humanoid
+		existing.characterModel = characterModel or existing.characterModel
+		existing.expiresAt = math.max(existing.expiresAt or 0, expiresAt)
+		existing.armed = true
+	else
+		pendingFallDamage[assemblyRoot] = {
+			humanoid = humanoid,
+			characterModel = characterModel,
+			expiresAt = expiresAt,
+			armed = true,
+		}
+	end
+end
+
+local function updatePendingFallDamage()
+	for assemblyRoot, info in pairs(pendingFallDamage) do
+		local humanoid = info.humanoid
+		local characterModel = info.characterModel
+
+		if not assemblyRoot or not assemblyRoot.Parent or not humanoid or humanoid.Health <= 0 then
+			pendingFallDamage[assemblyRoot] = nil
+		else
+			local modelToIgnore = characterModel or assemblyRoot:FindFirstAncestorOfClass("Model")
+			local groundY = getGroundYAtPosition(assemblyRoot.Position, modelToIgnore)
+			if groundY and assemblyRoot.Position.Y <= (groundY + FALL_DAMAGE_GROUND_BUFFER) and assemblyRoot.AssemblyLinearVelocity.Y <= 0 then
+				local impactPoint = Vector3.new(assemblyRoot.Position.X, groundY, assemblyRoot.Position.Z)
+				pendingFallDamage[assemblyRoot] = nil
+
+				if characterModel then
+					setCharacterTornadoFreeze(characterModel, humanoid, false)
+					ragdollCharacterOnDeath(characterModel)
+				end
+
+				spawnBloodSplatter(impactPoint)
+				pcall(function()
+					humanoid:ChangeState(Enum.HumanoidStateType.Dead)
+				end)
+				humanoid.Health = 0
+			elseif os.clock() > (info.expiresAt or 0) then
+				pendingFallDamage[assemblyRoot] = nil
+			end
+		end
+	end
+end
+
+local function sampleTriangular(rng, minVal, modeVal, maxVal)
+	minVal = math.min(minVal, maxVal)
+	maxVal = math.max(minVal, maxVal)
+	modeVal = math.clamp(modeVal, minVal, maxVal)
+
+	local u = rng:NextNumber()
+	local c = (modeVal - minVal) / (maxVal - minVal)
+
+	if u < c then
+		return minVal + math.sqrt(u * (maxVal - minVal) * (modeVal - minVal))
+	end
+
+	return maxVal - math.sqrt((1 - u) * (maxVal - minVal) * (maxVal - modeVal))
+end
+
+local function weightedBottomWidth(rng)
+	if rng:NextNumber() < 0.78 then
+		return sampleTriangular(rng, CONFIG.MinLowWidth, 22, 55)
+	end
+	return sampleTriangular(rng, 30, 120, CONFIG.MaxLowWidth)
+end
+
+local function makeTornadoSettings(rng, isTestStorm)
+	if isTestStorm then
+		return {
+			Mph = 200,
+			BottomWidth = sampleTriangular(rng, 10, 35, 120),
+			TopWidth = sampleTriangular(rng, 120, 450, CONFIG.MaxTopWidth),
+			MoveSpeed = sampleTriangular(rng, 7, 9, 11),
+			WindField = sampleTriangular(rng, 160, 200, 320),
+			PullZone = sampleTriangular(rng, 90, 140, 220),
+			AxisClimb = sampleTriangular(rng, 70, 80, 110),
+			Ropeyness = sampleTriangular(rng, 0.45, 0.9, 1.8),
+			Lifetime = sampleTriangular(rng, 260, 420, 900),
+			HasVortices = true,
+			TestStorm = true,
+		}
+	end
+
+	local lowWidth = weightedBottomWidth(rng)
+	local hugeChance = rng:NextNumber() < 0.035
+	local windField = hugeChance and sampleTriangular(rng, 260, 700, 2200) or sampleTriangular(rng, 120, CONFIG.AverageWindField, 900)
+	local pullZone = math.min(sampleTriangular(rng, 50, 120, windField), windField)
+
+	return {
+		Mph = hugeChance and sampleTriangular(rng, 120, 220, 340) or sampleTriangular(rng, 40, 110, 260),
+		BottomWidth = lowWidth,
+		TopWidth = hugeChance and sampleTriangular(rng, 700, 1400, CONFIG.MaxTopWidth) or math.min(math.max(lowWidth * sampleTriangular(rng, 5, 8, 16), lowWidth * 4), CONFIG.MaxTopWidth),
+		MoveSpeed = sampleTriangular(rng, 5, CONFIG.AverageMoveSpeed, 16),
+		WindField = windField,
+		PullZone = pullZone,
+		AxisClimb = sampleTriangular(rng, 45, CONFIG.AverageLiftUp, 140),
+		Ropeyness = sampleTriangular(rng, 0.25, 0.75, 2.3),
+		Lifetime = sampleTriangular(rng, 180, CONFIG.DefaultLifetime, 1200),
+		HasVortices = true,
+		TestStorm = false,
+	}
+end
+
+local function sampleSpawnInterval(rng)
+	local minI = CONFIG.SpawnMinInterval
+	local maxI = CONFIG.SpawnMaxInterval
+	local target = CONFIG.SpawnAverageInterval
+
+	local exponent = ((maxI - minI) / (target - minI)) - 1
+	exponent = math.clamp(exponent, 1.5, 12)
+
+	local t = rng:NextNumber() ^ exponent
+	return math.clamp(minI + (maxI - minI) * t, minI, maxI)
+end
+
+local function getOrCreateSpawnPad()
+	local pad = Workspace:FindFirstChild("TornadoSpawnPad")
+	if pad and pad:IsA("BasePart") then
+		return pad
+	end
+
+	pad = Instance.new("Part")
+	pad.Name = "TornadoSpawnPad"
+	pad.Anchored = true
+	pad.CanCollide = false
+	pad.CanTouch = false
+	pad.CanQuery = false
+	pad.Transparency = 1
+	pad.Size = Vector3.new(1000, 0.001, 1000)
+	pad.CFrame = CFrame.new(0, 0, 0)
+	pad.Parent = Workspace
+	return pad
+end
+
+local function chooseNaturalSpawnPoint(rng)
+	local candidates = {}
+
+	for _, inst in ipairs(Workspace:GetDescendants()) do
+		if inst:IsA("BasePart") and inst.Anchored and not inst:IsDescendantOf(TORNADO_FOLDER) and not inst:IsDescendantOf(BLOOD_FOLDER) then
+			if inst.Size.X >= CONFIG.SpawnMinWideSize and inst.Size.Y >= CONFIG.SpawnMinThickness and inst.Size.Z >= CONFIG.SpawnMinWideSize then
+				table.insert(candidates, inst)
+			end
+		end
+	end
+
+	if #candidates == 0 then
+		local pad = getOrCreateSpawnPad()
+		if pad.Size.X < CONFIG.SpawnMinWideSize or pad.Size.Z < CONFIG.SpawnMinWideSize then
+			pad.Size = Vector3.new(1000, 0.001, 1000)
+		end
+		return pad.Position + Vector3.new(rng:NextNumber(-100, 100), 10, rng:NextNumber(-100, 100))
+	end
+
+	local part = candidates[rng:NextInteger(1, #candidates)]
+	local halfX = math.max(part.Size.X * 0.5 - 50, 1)
+	local halfZ = math.max(part.Size.Z * 0.5 - 50, 1)
+
+	local localX = rng:NextNumber(-halfX, halfX)
+	local localZ = rng:NextNumber(-halfZ, halfZ)
+	local localY = part.Size.Y * 0.5 + 10
+
+	local worldPoint = part.CFrame:PointToWorldSpace(Vector3.new(localX, localY, localZ))
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Blacklist
+	params.IgnoreWater = true
+	params.FilterDescendantsInstances = { TORNADO_FOLDER, BLOOD_FOLDER }
+
+	local result = Workspace:Raycast(worldPoint + Vector3.new(0, 2000, 0), Vector3.new(0, -5000, 0), params)
+	if result and result.Position then
+		return result.Position
+	end
+
+	return worldPoint
+end
+
+local function probeShelterExposure(characterModel, rootPart)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Blacklist
+	params.IgnoreWater = true
+	params.FilterDescendantsInstances = { characterModel, TORNADO_FOLDER, BLOOD_FOLDER }
+
+	local origin = rootPart.Position + Vector3.new(0, 2, 0)
+	local directions = {
+		Vector3.new(1, 0, 0),
+		Vector3.new(-1, 0, 0),
+		Vector3.new(0, 0, 1),
+		Vector3.new(0, 0, -1),
+		Vector3.new(1, 0, 1).Unit,
+		Vector3.new(1, 0, -1).Unit,
+		Vector3.new(-1, 0, 1).Unit,
+		Vector3.new(-1, 0, -1).Unit,
+		Vector3.new(0, 1, 0),
+	}
+
+	local maxDist = 80
+	local bestDir = Vector3.new(1, 0, 0)
+	local bestDist = -1
+	local blockedCount = 0
+	local totalDist = 0
+
+	for _, dir in ipairs(directions) do
+		local result = Workspace:Raycast(origin, dir * maxDist, params)
+		local dist = result and (result.Position - origin).Magnitude or maxDist
+		totalDist += dist
+
+		if dist > bestDist then
+			bestDist = dist
+			bestDir = dir
+		end
+
+		if dist < 12 then
+			blockedCount += 1
+		end
+	end
+
+	local avgOpen = totalDist / #directions
+	local enclosed = blockedCount >= 6 and avgOpen < 24
+	local gapOpen = bestDist >= 28
+
+	return {
+		Enclosed = enclosed,
+		GapOpen = gapOpen,
+		GapDir = bestDir,
+		GapDistance = bestDist,
+		AvgOpen = avgOpen,
+	}
+end
+
+local function scheduleThrownDestroy(inst)
+	if inst and inst.Parent and not inst:GetAttribute("TornadoDestroyScheduled") then
+		inst:SetAttribute("TornadoDestroyScheduled", true)
+		Debris:AddItem(inst, CONFIG.DestroyThrownPartDelay)
+	end
+end
+
+local function registerStorm(storm)
+	activeStorms[storm.id] = storm
+end
+
+local function unregisterStorm(storm)
+	if storm and storm.id then
+		activeStorms[storm.id] = nil
+	end
+end
+
+local function destroyStorm(storm)
+	if not storm or storm.destroyed then
+		return
+	end
+	storm.destroyed = true
+	unregisterStorm(storm)
+	if storm.model and storm.model.Parent then
+		storm.model:Destroy()
+	end
+end
+
+local function getStormById(id)
+	return activeStorms[id]
+end
+
+local function isHugeTornado(base)
+	return math.max(base.bottomWidth or 0, base.topWidth or 0) > 2048
+end
+
+local function absorbStormIntoSurvivor(survivor, loser)
+	if not survivor or not loser or survivor.destroyed or loser.destroyed then
+		return
+	end
+
+	local combinedMph = math.max(survivor.base.mph, loser.base.mph) * 1.14 + math.min(survivor.base.mph, loser.base.mph) * 0.18
+	local combinedBottom = math.max(survivor.base.bottomWidth, loser.base.bottomWidth) * 1.18
+	local combinedTop = math.max(survivor.base.topWidth, loser.base.topWidth) * 1.22
+	local combinedWind = math.max(survivor.base.windField, loser.base.windField) * 1.35 + math.min(survivor.base.windField, loser.base.windField) * 0.25
+	local combinedPull = math.max(survivor.base.pullZone, loser.base.pullZone) * 1.25 + math.min(survivor.base.pullZone, loser.base.pullZone) * 0.2
+	local combinedAxis = math.max(survivor.base.axisClimb, loser.base.axisClimb) * 1.12
+	local combinedRope = math.max(survivor.base.ropeyness, loser.base.ropeyness) * 1.08
+	local combinedLifetime = math.max(survivor.base.lifetime, loser.base.lifetime) + 180
+
+	survivor.base.mph = math.clamp(combinedMph, 40, 500)
+	survivor.base.bottomWidth = math.clamp(combinedBottom, CONFIG.MinLowWidth, CONFIG.MaxLowWidth)
+	survivor.base.topWidth = math.clamp(combinedTop, math.max(survivor.base.bottomWidth * 3, CONFIG.MinTopWidth), CONFIG.MaxTopWidth)
+	survivor.base.windField = math.clamp(combinedWind, 50, 5000)
+	survivor.base.pullZone = math.clamp(combinedPull, 25, survivor.base.windField)
+	survivor.base.axisClimb = math.clamp(combinedAxis, 20, 220)
+	survivor.base.ropeyness = math.clamp(combinedRope, 0.12, 3.0)
+	survivor.base.lifetime = math.clamp(combinedLifetime, 120, 2400)
+
+	survivor.current.mph = survivor.base.mph
+	survivor.current.bottomWidth = survivor.base.bottomWidth
+	survivor.current.topWidth = survivor.base.topWidth
+	survivor.current.windField = survivor.base.windField
+	survivor.current.pullZone = survivor.base.pullZone
+	survivor.current.axisClimb = survivor.base.axisClimb
+	survivor.current.ropeyness = survivor.base.ropeyness
+
+	survivor.strength = math.clamp((survivor.strength or 1) + 0.55, 0.8, 2.5)
+	survivor.strengthTarget = math.clamp((survivor.strengthTarget or 1) + 0.35, 0.9, 2.8)
+	survivor.deathTime = math.max(survivor.deathTime or 0, os.clock() + 120)
+
+	if survivor.root and loser.root then
+		survivor.root.Position = (survivor.root.Position + loser.root.Position) * 0.5
+	end
+end
+
+local function endStormDuelWithRelease(a, b, duel)
+	if not a or not b or not duel or duel.resolved then
+		return
+	end
+	duel.resolved = true
+
+	local awayA = safeUnit(a.root.Position - b.root.Position)
+	local awayB = -awayA
+	if awayA == Vector3.zero then
+		awayA = randomFlatDirection(a.rng)
+	end
+	if awayB == Vector3.zero then
+		awayB = -awayA
+	end
+
+	local preA = duel.preOrbitSpeedA or a.current.moveSpeed or 40
+	local preB = duel.preOrbitSpeedB or b.current.moveSpeed or 40
+	local dirA = safeUnit(duel.preOrbitDirA or awayA)
+	local dirB = safeUnit(duel.preOrbitDirB or awayB)
+
+	if dirA == Vector3.zero then
+		dirA = awayA
+	end
+	if dirB == Vector3.zero then
+		dirB = awayB
+	end
+
+	a.launchVelocity = safeUnit((awayA * 0.8) + (dirA * 0.2)) * math.max(preA, 40)
+	b.launchVelocity = safeUnit((awayB * 0.8) + (dirB * 0.2)) * math.max(preB, 40)
+
+	a.duel = nil
+	b.duel = nil
+	a.duelSide = nil
+	b.duelSide = nil
+end
+
+local function endStormDuelWithMerge(a, b, duel)
+	if not a or not b or not duel or duel.resolved then
+		return
+	end
+	duel.resolved = true
+
+	local survivor = a
+	local loser = b
+	if (b.current.windField or 0) > (a.current.windField or 0) or (b.current.topWidth or 0) > (a.current.topWidth or 0) then
+		survivor = b
+		loser = a
+	end
+
+	absorbStormIntoSurvivor(survivor, loser)
+
+	if a then
+		a.duel = nil
+		a.duelSide = nil
+	end
+	if b then
+		b.duel = nil
+		b.duelSide = nil
+	end
+
+	destroyStorm(loser)
+end
+
+local function beginStormDuel(a, b, t)
+	if not a or not b or a.destroyed or b.destroyed then
+		return
+	end
+	if a.duel or b.duel then
+		return
+	end
+
+	local duel = {
+		partnerIdA = a.id,
+		partnerIdB = b.id,
+		startedAt = t,
+		resolveAt = t + a.rng:NextNumber(2.5, 6.5),
+		chaos = 0,
+		resolved = false,
+		preOrbitSpeedA = math.max((a.rootVelocity and a.rootVelocity.Magnitude) or 0, a.current.moveSpeed or 0),
+		preOrbitSpeedB = math.max((b.rootVelocity and b.rootVelocity.Magnitude) or 0, b.current.moveSpeed or 0),
+		preOrbitDirA = safeUnit(a.rootVelocity),
+		preOrbitDirB = safeUnit(b.rootVelocity),
+		initialDistance = (a.root.Position - b.root.Position).Magnitude,
+	}
+
+	a.duel = duel
+	b.duel = duel
+	a.duelSide = 1
+	b.duelSide = -1
+	a.launchVelocity = a.launchVelocity or Vector3.zero
+	b.launchVelocity = b.launchVelocity or Vector3.zero
+end
+
+local function findInteractionPartner(storm)
+	local best
+	local bestDist = math.huge
+
+	for _, other in pairs(activeStorms) do
+		if other ~= storm and other and other.model and other.model.Parent and not other.destroyed then
+			if not other.duel and (storm.id < other.id) then
+				local dist = (storm.root.Position - other.root.Position).Magnitude
+				local fieldRadius = math.max(storm.current.windField or 0, other.current.windField or 0)
+				local widthRadius = math.max(storm.current.topWidth or 0, other.current.topWidth or 0)
+				local triggerRadius = math.max(fieldRadius * 0.72, 650) + widthRadius * 0.15
+				if dist <= triggerRadius and dist < bestDist then
+					best = other
+					bestDist = dist
+				end
+			end
+		end
+	end
+
+	return best
+end
+
+local function makeCloudPlates(parent)
+	local plates = {}
+	local index = 1
+
+	for gx = -CONFIG.CloudGridRadius, CONFIG.CloudGridRadius do
+		for gz = -CONFIG.CloudGridRadius, CONFIG.CloudGridRadius do
+			local dist = math.sqrt(gx * gx + gz * gz)
+			if dist <= CONFIG.CloudGridRadius + 0.35 then
+				local plate = Instance.new("Part")
+				plate.Name = "TopCloudPlate"
+				plate.Anchored = true
+				plate.CanCollide = false
+				plate.CanTouch = false
+				plate.CanQuery = false
+				plate.Material = Enum.Material.SmoothPlastic
+				plate.Color = Color3.fromRGB(170, 170, 170)
+				plate.Transparency = 1
+				plate.Size = Vector3.new(2048, 0.3, 2048)
+				plate.Parent = parent
+				plate:SetAttribute("CloudGX", gx)
+				plate:SetAttribute("CloudGZ", gz)
+				plate:SetAttribute("CloudSpacing", CONFIG.CloudGridSpacing)
+				plates[index] = plate
+				index += 1
+			end
+		end
+	end
+
+	return plates
+end
+
+local function spawnTornado(origin, settings)
+	local rng = Random.new(math.floor(os.clock() * 1000000) % 2147483647)
+
+	local base = {
+		mph = settings.Mph,
+		bottomWidth = settings.BottomWidth,
+		topWidth = settings.TopWidth,
+		moveSpeed = settings.MoveSpeed,
+		windField = settings.WindField,
+		pullZone = settings.PullZone,
+		axisClimb = settings.AxisClimb,
+		ropeyness = settings.Ropeyness,
+		lifetime = settings.Lifetime,
+		hasVortices = settings.HasVortices,
+		testStorm = settings.TestStorm,
+	}
+
+	local model = Instance.new("Model")
+	model.Name = "RopeTornado"
+	model.Parent = TORNADO_FOLDER
+
+	stormIdCounter += 1
+
+	local root = Instance.new("Part")
+	root.Name = "Root"
+	root.Anchored = true
+	root.Transparency = 1
+	root.CanCollide = false
+	root.CanTouch = false
+	root.CanQuery = false
+	root.Size = Vector3.new(1, 1, 1)
+	root.Position = origin
+	root.Parent = model
+
+	local current = {
+		mph = base.mph,
+		bottomWidth = base.bottomWidth,
+		topWidth = base.topWidth,
+		moveSpeed = base.moveSpeed,
+		windField = base.windField,
+		pullZone = base.pullZone,
+		axisClimb = base.axisClimb,
+		ropeyness = base.ropeyness,
+		spinSpeed = rng:NextNumber(4.8, 8.3),
+	}
+
+	local hugeMode = isHugeTornado(base)
+	local funnelHeight = hugeMode and CONFIG.HugeFunnelHeight or CONFIG.FunnelHeight
+	local widthAlpha = math.clamp((CONFIG.MaxLowWidth - current.bottomWidth) / math.max(CONFIG.MaxLowWidth - CONFIG.MinLowWidth, 1), 0, 1)
+	local segmentCount = hugeMode and math.clamp(math.floor(40 + widthAlpha * 20), CONFIG.HugeMinSegments, CONFIG.HugeMaxSegments) or math.clamp(math.floor(160 + widthAlpha * 90), CONFIG.MinSegments, CONFIG.MaxSegments)
+	local segmentFractions = table.create(segmentCount)
+	for i = 1, segmentCount do
+		segmentFractions[i] = (segmentCount == 1) and 0 or ((i - 1) / (segmentCount - 1))
+	end
+
+	local rootTouchHeight = current.bottomWidth * 0.5
+
+	local dustField = Instance.new("Part")
+	dustField.Name = "LowerDustField"
+	dustField.Anchored = true
+	dustField.Transparency = 1
+	dustField.CanCollide = false
+	dustField.CanTouch = false
+	dustField.CanQuery = false
+	dustField.Size = Vector3.new(1, 1, 1)
+	dustField.Parent = model
+
+	local dustAttachment = Instance.new("Attachment")
+	dustAttachment.Name = "DustEmitterAttachment"
+	dustAttachment.Parent = dustField
+
+	local dustEmitter = Instance.new("ParticleEmitter")
+	dustEmitter.Texture = "rbxasset://textures/particles/smoke_main.dds"
+	dustEmitter.Color = ColorSequence.new(Color3.fromRGB(92, 66, 39), Color3.fromRGB(130, 95, 60))
+	dustEmitter.LightEmission = 0
+	dustEmitter.LightInfluence = 0
+	dustEmitter.LockedToPart = true
+	dustEmitter.Rate = 180
+	dustEmitter.Lifetime = NumberRange.new(1.2, 2.0)
+	dustEmitter.Speed = NumberRange.new(1.0, 4.0)
+	dustEmitter.SpreadAngle = Vector2.new(180, 180)
+	dustEmitter.Rotation = NumberRange.new(0, 360)
+	dustEmitter.RotSpeed = NumberRange.new(-100, 100)
+	dustEmitter.Drag = 6
+	dustEmitter.Acceleration = Vector3.new(0, 1.2, 0)
+	dustEmitter.EmissionDirection = Enum.NormalId.Top
+	dustEmitter.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 12),
+		NumberSequenceKeypoint.new(1, 18),
+	})
+	dustEmitter.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.12),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	dustEmitter.Parent = dustAttachment
+
+	local topCloudPlates = makeCloudPlates(model)
+
+	local segments = table.create(segmentCount)
+	local segmentWorldPositions = table.create(segmentCount)
+	local segmentWorldRadii = table.create(segmentCount)
+
+	for i = 1, segmentCount do
+		local p = Instance.new("Part")
+		p.Name = "TornadoSphere"
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanTouch = false
+		p.CanQuery = false
+		p.Material = Enum.Material.SmoothPlastic
+		p.Shape = Enum.PartType.Ball
+		p.Color = Color3.fromRGB(60, 60, 60)
+		p.Transparency = 1
+		p.Size = Vector3.new(math.min(current.bottomWidth, 2048), math.min(current.bottomWidth, 2048), math.min(current.bottomWidth, 2048))
+		p.Parent = model
+		segments[i] = p
+	end
+
+	local storm = {
+		id = stormIdCounter,
+		rng = rng,
+		model = model,
+		root = root,
+		dustField = dustField,
+		dustAttachment = dustAttachment,
+		dustEmitter = dustEmitter,
+		topCloudPlates = topCloudPlates,
+
+		base = base,
+		current = current,
+
+		segments = segments,
+		segmentFractions = segmentFractions,
+		segmentWorldPositions = segmentWorldPositions,
+		segmentWorldRadii = segmentWorldRadii,
+		segmentCount = segmentCount,
+		segmentSpacing = funnelHeight / math.max(segmentCount, 1),
+
+		overlapParams = nil,
+		windStates = {},
+		structureStates = {},
+		vortices = {},
+
+		startTime = os.clock(),
+		deathTime = os.clock() + base.lifetime,
+		currentGroundY = origin.Y,
+		lastRootPosition = root.Position,
+		rootVelocity = Vector3.zero,
+
+		moveDir = randomFlatDirection(rng),
+		moveTargetDir = randomFlatDirection(rng),
+		nextMoveRetarget = 0,
+		straightUntil = rng:NextNumber(30, 300),
+
+		bendDir = hugeMode and Vector3.zero or randomFlatDirection(rng),
+		bendTargetDir = hugeMode and Vector3.zero or randomFlatDirection(rng),
+		nextBendRetarget = 0,
+
+		strength = rng:NextNumber(0.9, 1.1),
+		strengthTarget = rng:NextNumber(0.85, 1.2),
+		nextStrengthChange = rng:NextNumber(8, 22),
+
+		formationAlpha = 0,
+		vortexCooldown = 0,
+		nextVortexAt = 12,
+		burstUntil = nil,
+		burstStrength = nil,
+
+		launchVelocity = Vector3.zero,
+		duel = nil,
+		duelSide = nil,
+		destroyed = false,
+
+		hugeMode = hugeMode,
+		funnelHeight = funnelHeight,
+	}
+
+	registerStorm(storm)
+
+	storm.overlapParams = OverlapParams.new()
+	storm.overlapParams.FilterType = Enum.RaycastFilterType.Blacklist
+	storm.overlapParams.FilterDescendantsInstances = { model, TORNADO_FOLDER, BLOOD_FOLDER }
+	storm.overlapParams.RespectCanCollide = false
+
+	local function tornadoOffsetAtHeight(heightStuds, t)
+		if storm.hugeMode then
+			return Vector3.zero
+		end
+
+		local heightAlpha = math.clamp(heightStuds / storm.funnelHeight, 0, 1)
+		local growthScale = 0.88 + math.clamp(t / 180, 0, 1) * 0.32
+		local wiggleScale = 0.18
+
+		local curveNoiseX = math.noise(storm.startTime + 4100, t * 0.025, heightAlpha * 1.4) * wiggleScale
+		local curveNoiseZ = math.noise(storm.startTime + 5100, 0, t * 0.025 + heightAlpha * 1.0) * wiggleScale
+
+		local curveDir = Vector3.new(curveNoiseX, 0, curveNoiseZ)
+		if curveDir.Magnitude < 0.01 then
+			curveDir = Vector3.new(1, 0, 0)
+		end
+		curveDir = curveDir.Unit
+
+		local lowerAmount = (35 + math.abs(math.noise(storm.startTime + 3100, t * 0.08, 0)) * 35) * current.ropeyness * growthScale
+		local upperAmount = (120 + math.abs(math.noise(storm.startTime + 3200, 0, t * 0.06)) * 100) * current.ropeyness * growthScale
+		local stretchPulse = 1 + math.abs(math.noise(storm.startTime + 3400, t * 0.12, 0)) * 0.12
+
+		local bottomWeight = (1 - heightAlpha) ^ 0.85
+		local topWeight = heightAlpha ^ 1.1
+
+		local lowerPart = storm.bendDir * (lowerAmount * bottomWeight)
+		local upperPart = curveDir * (upperAmount * topWeight)
+		local stretchBias = (curveDir - storm.bendDir) * ((1 - math.abs(heightAlpha - 0.5) * 2) ^ 1.6) * 12 * current.ropeyness
+
+		return (lowerPart + upperPart + stretchBias) * stretchPulse
+	end
+
+	local function getClosestPointOnTornado(pos)
+		local count = #storm.segmentWorldPositions
+		if count == 0 then
+			return storm.root.Position, WORLD_UP, current.bottomWidth * 0.5
+		end
+
+		if count == 1 then
+			return storm.segmentWorldPositions[1], WORLD_UP, storm.segmentWorldRadii[1] or (current.bottomWidth * 0.5)
+		end
+
+		local bestPoint = storm.segmentWorldPositions[1]
+		local bestTangent = WORLD_UP
+		local bestRadius = storm.segmentWorldRadii[1] or (current.bottomWidth * 0.5)
+		local bestDistance = math.huge
+
+		for i = 1, count - 1 do
+			local a = storm.segmentWorldPositions[i]
+			local b = storm.segmentWorldPositions[i + 1]
+			local ab = b - a
+			local abLenSq = ab:Dot(ab)
+
+			local tAlpha = 0
+			if abLenSq > 0.001 then
+				tAlpha = math.clamp((pos - a):Dot(ab) / abLenSq, 0, 1)
+			end
+
+			local point = a + ab * tAlpha
+			local distance = (pos - point).Magnitude
+
+			if distance < bestDistance then
+				bestDistance = distance
+				bestPoint = point
+				bestTangent = safeUnit(ab)
+				bestRadius = ((storm.segmentWorldRadii[i] or bestRadius) + (storm.segmentWorldRadii[i + 1] or bestRadius)) * 0.5
+			end
+		end
+
+		return bestPoint, bestTangent, bestRadius
+	end
+
+	local function getTornadoFrameAtHeight(heightStuds)
+		local count = #storm.segmentWorldPositions
+		if count == 0 then
+			return storm.root.Position + Vector3.new(0, heightStuds + rootTouchHeight, 0), WORLD_UP, current.bottomWidth * 0.5
+		end
+
+		if count == 1 then
+			return storm.segmentWorldPositions[1], WORLD_UP, storm.segmentWorldRadii[1] or (current.bottomWidth * 0.5)
+		end
+
+		local h = math.clamp(heightStuds, 0, storm.funnelHeight)
+		local i1 = math.clamp(math.floor((h / storm.funnelHeight) * count) + 1, 1, count)
+		local i2 = math.clamp(i1 + 1, 1, count)
+
+		local h1 = (storm.segmentFractions[i1] or 0) * storm.funnelHeight
+		local h2 = (storm.segmentFractions[i2] or storm.segmentFractions[i1] or 0) * storm.funnelHeight
+		local alpha = 0
+		if h2 > h1 then
+			alpha = math.clamp((h - h1) / (h2 - h1), 0, 1)
+		end
+
+		local p1 = storm.segmentWorldPositions[i1] or storm.root.Position
+		local p2 = storm.segmentWorldPositions[i2] or p1
+		local point = p1:Lerp(p2, alpha)
+
+		local tangent = safeUnit(p2 - p1)
+		if tangent == Vector3.zero then
+			tangent = WORLD_UP
+		end
+
+		local r1 = storm.segmentWorldRadii[i1] or (current.bottomWidth * 0.5)
+		local r2 = storm.segmentWorldRadii[i2] or r1
+		local radius = r1 + (r2 - r1) * alpha
+
+		return point, tangent, radius
+	end
+
+	local function spawnHorizontalVortex(isTestStorm)
+		if not storm.model or not storm.model.Parent then
+			return nil
+		end
+
+		local vortexModel = Instance.new("Model")
+		vortexModel.Name = "HorizontalVortex"
+		vortexModel.Parent = storm.model
+
+		local lifetime = isTestStorm and rng:NextNumber(30, 60) or rng:NextNumber(CONFIG.HorizontalVortexMinLifetime, CONFIG.HorizontalVortexMaxLifetime)
+		local length = isTestStorm and rng:NextNumber(1200, 3000) or rng:NextNumber(CONFIG.HorizontalVortexMinLength, CONFIG.HorizontalVortexMaxLength)
+		local endWidth = isTestStorm and rng:NextNumber(30, 90) or rng:NextNumber(5, 20)
+		local baseWidth = isTestStorm and rng:NextNumber(180, 420) or rng:NextNumber(50, 120)
+		local segCount = 18
+		local segs = table.create(segCount)
+
+		for i = 1, segCount do
+			local p = Instance.new("Part")
+			p.Name = "VortexSeg"
+			p.Anchored = true
+			p.CanCollide = false
+			p.CanTouch = false
+			p.CanQuery = false
+			p.Material = Enum.Material.SmoothPlastic
+			p.Shape = Enum.PartType.Ball
+			p.Color = Color3.fromRGB(90, 90, 90)
+			p.Transparency = 0
+			p.Parent = vortexModel
+			segs[i] = p
+		end
+
+		return {
+			model = vortexModel,
+			segs = segs,
+			startTime = os.clock(),
+			endTime = os.clock() + lifetime,
+			length = length,
+			baseWidth = baseWidth,
+			endWidth = endWidth,
+			sideSign = rng:NextInteger(0, 1) == 0 and -1 or 1,
+			attachHeight = rng:NextNumber(100, 300),
+		}
+	end
+
+	local function updateHorizontalVortex(vortex, dt, t)
+		if not vortex or not vortex.model or not vortex.model.Parent then
+			return false
+		end
+
+		if os.clock() >= vortex.endTime then
+			vortex.model:Destroy()
+			return false
+		end
+
+		local grow = math.clamp((t - vortex.startTime) / 6, 0, 1)
+		local totalLength = vortex.length * grow
+
+		local centerPoint, axisDir, funnelRadius = getTornadoFrameAtHeight(vortex.attachHeight)
+		local basis1, basis2 = buildOrbitBasis(axisDir, nil, storm.moveDir.Magnitude > 0.01 and storm.moveDir or Vector3.new(1, 0, 0))
+
+		local outwardDir = safeUnit(basis1 * vortex.sideSign)
+		if outwardDir == Vector3.zero then
+			outwardDir = Vector3.new(1, 0, 0)
+		end
+
+		local startPoint = centerPoint + outwardDir * math.max(funnelRadius * 1.05, 1)
+		local lineDir = safeUnit(outwardDir + axisDir * 0.05)
+		if lineDir == Vector3.zero then
+			lineDir = outwardDir
+		end
+
+		local segLen = math.max(totalLength / #vortex.segs, 24)
+
+		for i, part in ipairs(vortex.segs) do
+			local segAlpha = (i - 1) / math.max(#vortex.segs - 1, 1)
+			local radius = vortex.baseWidth + (vortex.endWidth - vortex.baseWidth) * segAlpha
+			local pos = startPoint + lineDir * (totalLength * segAlpha)
+
+			part.Size = Vector3.new(radius, radius, radius)
+			part.Transparency = math.clamp(0.05 + (1 - grow) * 0.15, 0, 0.9)
+			part.Color = Color3.fromRGB(85, 85, 85)
+			part.CFrame = CFrame.new(pos)
+		end
+
+		local broadSize = Vector3.new(math.max(totalLength, 300), 300, math.max(totalLength, 300))
+		local parts = Workspace:GetPartBoundsInBox(CFrame.new(startPoint + lineDir * (totalLength * 0.5)), broadSize, storm.overlapParams)
+
+		for _, part in ipairs(parts) do
+			if part and part:IsA("BasePart") and not shouldIgnoreWindPart(part) then
+				local assemblyRoot = part.AssemblyRootPart
+				if assemblyRoot and assemblyRoot:IsA("BasePart") and not shouldIgnoreWindPart(assemblyRoot) then
+					local charModel, humanoid = getCharacterModelFromRoot(assemblyRoot)
+					local isCharacter = humanoid ~= nil
+
+					local toLine = assemblyRoot.Position - startPoint
+					local along = toLine:Dot(lineDir)
+					local closest = startPoint + lineDir * math.clamp(along, 0, totalLength)
+					local dist = (assemblyRoot.Position - closest).Magnitude
+
+					if dist <= math.max(vortex.baseWidth, vortex.endWidth) * 2.5 then
+						local pullDir = safeUnit(closest - assemblyRoot.Position)
+						if pullDir == Vector3.zero then
+							pullDir = Vector3.new(1, 0, 0)
+						end
+
+						local targetVelocity =
+							pullDir * math.clamp(40 + dist * 3.5, 35, 220)
+							+ lineDir * 55
+							+ Vector3.new(0, 35 + current.axisClimb * 0.2, 0)
+							+ storm.rootVelocity * 0.2
+
+						if isCharacter then
+							targetVelocity = clampVectorMagnitude(targetVelocity, WIND_MAX_CHARACTER_SPEED)
+							applyVelocityToCharacter(charModel, targetVelocity, Vector3.zero)
+							setCharacterTornadoFreeze(charModel, humanoid, true)
+							armFallDamage(assemblyRoot, humanoid, charModel)
+						else
+							targetVelocity = clampVectorMagnitude(targetVelocity, WIND_MAX_OBJECT_SPEED)
+							applyVelocityToAssembly(assemblyRoot, targetVelocity, Vector3.zero)
+							scheduleThrownDestroy(assemblyRoot)
+						end
+					end
+				end
+			end
+		end
+
+		return true
+	end
+
+	local function updateVortices(dt, t)
+		if not storm.base.hasVortices then
+			return
+		end
+
+		if t >= storm.nextVortexAt and storm.vortexCooldown <= 0 then
+			local vortex = spawnHorizontalVortex(storm.base.testStorm)
+			if vortex then
+				table.insert(storm.vortices, vortex)
+			end
+			storm.nextVortexAt = t + CONFIG.HorizontalVortexInterval
+			storm.vortexCooldown = 6
+		end
+
+		storm.vortexCooldown = math.max(0, storm.vortexCooldown - dt)
+
+		for i = #storm.vortices, 1, -1 do
+			local alive = updateHorizontalVortex(storm.vortices[i], dt, t)
+			if not alive then
+				table.remove(storm.vortices, i)
+			end
+		end
+	end
+
+	local function updateDynamicStats(t, dt)
+		storm.strength = storm.strength + (storm.strengthTarget - storm.strength) * math.clamp(dt * 0.04, 0, 1)
+
+		local growth = math.clamp(t / 180, 0, 1)
+		local growthScale = 0.88 + growth * 0.32
+
+		local noiseA = math.noise(storm.startTime + 1000, t * 0.018, 0)
+		local noiseB = math.noise(storm.startTime + 2000, 0, t * 0.015)
+		local pulse = noiseA * 0.02 + noiseB * 0.02
+
+		if not storm.burstUntil and t > 120 and rng:NextNumber() < (dt * 0.00005) then
+			storm.burstUntil = t + rng:NextNumber(18, 40)
+			storm.burstStrength = rng:NextNumber(1.15, 1.6)
+		end
+
+		local burstMult = 1
+		if storm.burstUntil and t <= storm.burstUntil then
+			burstMult = storm.burstStrength or 1.2
+		elseif storm.burstUntil and t > storm.burstUntil then
+			storm.burstUntil = nil
+			storm.burstStrength = nil
+		end
+
+		current.mph = math.clamp(base.mph * (growthScale + storm.strength * 0.10 + pulse), 40, 500)
+		current.bottomWidth = math.clamp(base.bottomWidth * (growthScale + storm.strength * 0.06 + pulse), CONFIG.MinLowWidth, CONFIG.MaxLowWidth)
+		current.topWidth = math.clamp(base.topWidth * (growthScale + storm.strength * 0.08 + pulse), math.max(current.bottomWidth * 3, CONFIG.MinTopWidth), CONFIG.MaxTopWidth)
+		current.moveSpeed = math.clamp(base.moveSpeed * (growthScale + storm.strength * 0.05 + pulse), 2, 20)
+		current.windField = math.clamp(base.windField * (growthScale + storm.strength * 0.08 + pulse) * burstMult, 50, 5000)
+		current.pullZone = math.min(math.clamp(base.pullZone * (growthScale + storm.strength * 0.10 + pulse) * burstMult, 25, current.windField), current.windField)
+		current.axisClimb = math.clamp(base.axisClimb * (growthScale + storm.strength * 0.06 + pulse), 20, 180)
+		current.ropeyness = math.clamp(base.ropeyness * (growthScale + storm.strength * 0.04) + math.abs(noiseA) * 0.03, 0.12, 3.0)
+
+		if storm.hugeMode then
+			current.spinSpeed = 0
+			storm.bendDir = Vector3.zero
+		else
+			current.spinSpeed = math.clamp(6.5 * (0.75 + storm.strength * 0.30), 3, 24)
+		end
+
+		if storm.duel and not storm.duel.resolved then
+			local duel = storm.duel
+			local elapsed = t - (duel.startedAt or t)
+			current.mph = math.clamp(current.mph + elapsed * 1.2, 40, 500)
+			current.moveSpeed = math.clamp(current.moveSpeed + elapsed * 0.8, 2, 28)
+			current.windField = math.clamp(current.windField * (1 + math.clamp(elapsed * 0.09, 0, 1.1)), 50, 5000)
+			current.pullZone = math.min(current.windField, current.pullZone * (1 + math.clamp(elapsed * 0.08, 0, 0.9)))
+			current.axisClimb = math.clamp(current.axisClimb + elapsed * 0.9, 20, 220)
+		end
+	end
+
+	local function retargetMovement(t)
+		if storm.duel and not storm.duel.resolved then
+			return
+		end
+
+		if t >= storm.nextMoveRetarget then
+			storm.moveTargetDir = randomFlatDirection(rng)
+			storm.nextMoveRetarget = t + rng:NextNumber(1.4, 5.2)
+		end
+
+		if not storm.hugeMode then
+			if t >= storm.nextBendRetarget then
+				storm.bendTargetDir = randomFlatDirection(rng)
+				storm.nextBendRetarget = t + rng:NextNumber(1.1, 4.3)
+			end
+			storm.moveDir = safeUnit(storm.moveDir:Lerp(storm.moveTargetDir, 0.015))
+			storm.bendDir = safeUnit(storm.bendDir:Lerp(storm.bendTargetDir, 0.012))
+			if storm.moveDir == Vector3.zero then
+				storm.moveDir = randomFlatDirection(rng)
+			end
+			if storm.bendDir == Vector3.zero then
+				storm.bendDir = randomFlatDirection(rng)
+			end
+		else
+			storm.moveDir = safeUnit(storm.moveDir:Lerp(storm.moveTargetDir, 0.012))
+			if storm.moveDir == Vector3.zero then
+				storm.moveDir = randomFlatDirection(rng)
+			end
+			storm.bendDir = Vector3.zero
+		end
+
+		if t >= storm.nextStrengthChange then
+			storm.strengthTarget = sampleTriangular(rng, 0.65, 1.0, 1.6)
+			storm.nextStrengthChange = t + rng:NextNumber(8, 28)
+		end
+
+		if t >= storm.straightUntil then
+			storm.moveTargetDir = randomFlatDirection(rng)
+			storm.straightUntil = t + rng:NextNumber(30, 300)
+		end
+
+		local desiredHorizontal = Vector3.new(storm.moveDir.X, 0, storm.moveDir.Z)
+		if desiredHorizontal.Magnitude < 0.01 then
+			desiredHorizontal = Vector3.new(1, 0, 0)
+		end
+		desiredHorizontal = desiredHorizontal.Unit
+
+		local proposedPos = storm.root.Position + desiredHorizontal * current.moveSpeed * math.min(0.5, 0.016)
+		local aheadGroundY = getGroundYAtPosition(proposedPos + desiredHorizontal * 250, storm.model)
+		if aheadGroundY == nil then
+			storm.moveTargetDir = randomFlatDirection(rng)
+			storm.straightUntil = t + rng:NextNumber(30, 300)
+		end
+	end
+
+	local function updateHugeVisualStack(t, dt)
+		local step = storm.funnelHeight / math.max(storm.segmentCount, 1)
+
+		for i = 1, storm.segmentCount do
+			local frac = storm.segmentFractions[i] or 0
+			local h = frac * storm.funnelHeight
+			local width = current.bottomWidth + (current.topWidth - current.bottomWidth) * (frac ^ 0.42)
+			local visualSize = math.min(width, 2048)
+
+			local targetPos = Vector3.new(
+				storm.root.Position.X,
+				storm.currentGroundY + (1 - storm.formationAlpha) * 450 + h + rootTouchHeight,
+				storm.root.Position.Z
+			)
+
+			local part = storm.segments[i]
+			part.Size = Vector3.new(visualSize, visualSize, visualSize)
+			part.Transparency = 1 - math.clamp(storm.formationAlpha * 1.05, 0, 1)
+			part.Color = Color3.fromRGB(math.clamp(58 + frac * 24, 50, 92), math.clamp(58 + frac * 24, 50, 92), math.clamp(58 + frac * 24, 50, 92))
+			part.CFrame = CFrame.new(targetPos)
+
+			storm.segmentWorldPositions[i] = targetPos
+			storm.segmentWorldRadii[i] = width * 0.5
+		end
+
+		storm.dustField.Position = Vector3.new(storm.root.Position.X, storm.currentGroundY, storm.root.Position.Z)
+		storm.rootVelocity = Vector3.zero
+		if dt > 0.0001 then
+			storm.rootVelocity = (storm.root.Position - storm.lastRootPosition) / dt
+		end
+		storm.lastRootPosition = storm.root.Position
+	end
+
+	local function updateFormationAndVisuals(t, dt)
+		storm.formationAlpha = math.clamp(t / CONFIG.TouchdownDuration, 0, 1)
+
+		if storm.hugeMode then
+			for _, plate in ipairs(storm.topCloudPlates) do
+				plate.Transparency = 1
+			end
+			updateHugeVisualStack(t, dt)
+			return
+		end
+
+		local touchLift = (1 - storm.formationAlpha) * 450
+
+		local baseOffset = tornadoOffsetAtHeight(0, t)
+		local baseWorldPos = Vector3.new(
+			storm.root.Position.X + baseOffset.X,
+			storm.currentGroundY + touchLift + rootTouchHeight,
+			storm.root.Position.Z + baseOffset.Z
+		)
+
+		local topOffset = tornadoOffsetAtHeight(storm.funnelHeight, t)
+		local topWorldPos = Vector3.new(
+			storm.root.Position.X + topOffset.X,
+			storm.currentGroundY + storm.funnelHeight + touchLift + rootTouchHeight,
+			storm.root.Position.Z + topOffset.Z
+		)
+
+		storm.dustField.Position = baseWorldPos
+		storm.dustAttachment.Position = Vector3.new(0, 0, 0)
+
+		local right = Vector3.new(1, 0, 0)
+		local back = Vector3.new(0, 0, 1)
+		if storm.moveDir.Magnitude > 0.01 then
+			back = -Vector3.new(storm.moveDir.X, 0, storm.moveDir.Z).Unit
+			right = Vector3.new(-back.Z, 0, back.X).Unit
+		end
+
+		local cloudRadius = math.clamp(CONFIG.CloudCoverageBaseRadius + current.topWidth * 8, CONFIG.CloudCoverageBaseRadius, CONFIG.CloudCoverageMaxRadius)
+		local cloudScale = math.clamp(current.topWidth / 2048, 0.5, 5)
+
+		for _, plate in ipairs(storm.topCloudPlates) do
+			local gx = plate:GetAttribute("CloudGX") or 0
+			local gz = plate:GetAttribute("CloudGZ") or 0
+			local spacing = plate:GetAttribute("CloudSpacing") or CONFIG.CloudGridSpacing
+			local offset = right * (gx * spacing) + back * (gz * spacing)
+			local dist = Vector3.new(offset.X, 0, offset.Z).Magnitude
+
+			plate.Position = topWorldPos + offset
+			local visible = math.clamp((cloudRadius - dist) / 1800, 0, 1)
+			plate.Transparency = 1 - math.clamp(storm.formationAlpha * visible * cloudScale, 0, 1)
+			plate.Size = Vector3.new(math.clamp(current.topWidth * 1.15, 512, 4096), 0.3, math.clamp(current.topWidth * 1.15, 512, 4096))
+		end
+
+		local previousTip = baseWorldPos
+		local previousDir = Vector3.new(0, 1, 0)
+
+		for i = 1, storm.segmentCount do
+			local frac = storm.segmentFractions[i] or 0
+			local h = frac * storm.funnelHeight
+			local targetOffset = tornadoOffsetAtHeight(h, t)
+			local targetPos = Vector3.new(
+				storm.root.Position.X + targetOffset.X,
+				storm.currentGroundY + touchLift + h + rootTouchHeight,
+				storm.root.Position.Z + targetOffset.Z
+			)
+
+			local part = storm.segments[i]
+			local width = current.bottomWidth + (current.topWidth - current.bottomWidth) * (frac ^ 0.42)
+			local visualSize = math.min(width, 2048)
+
+			part.Size = Vector3.new(visualSize, visualSize, visualSize)
+			part.Color = Color3.fromRGB(math.clamp(58 + frac * 24, 50, 92), math.clamp(58 + frac * 24, 50, 92), math.clamp(58 + frac * 24, 50, 92))
+			storm.segmentWorldPositions[i] = targetPos
+			storm.segmentWorldRadii[i] = width * 0.5
+
+			local appear = math.clamp((storm.formationAlpha * 1.15) - (frac * 0.55), 0, 1)
+			part.Transparency = 1 - appear
+
+			if i == 1 then
+				part.CFrame = CFrame.new(targetPos)
+				previousTip = targetPos + Vector3.new(0, math.max(storm.segmentSpacing * 0.5, 1), 0)
+				previousDir = Vector3.new(0, 1, 0)
+			else
+				local desiredDir = safeUnit(targetPos - previousTip)
+				if desiredDir == Vector3.zero then
+					desiredDir = previousDir
+				end
+
+				local bendBlend = math.clamp(0.07 + (1 - frac) * 0.12, 0.07, 0.18)
+				local dir = safeUnit(previousDir:Lerp(desiredDir, bendBlend))
+				if dir == Vector3.zero then
+					dir = desiredDir
+				end
+
+				local center = previousTip + dir * (math.max(storm.segmentSpacing, 1) * 0.5)
+				part.CFrame = frameFromDirection(center, dir)
+
+				previousTip = previousTip + dir * math.max(storm.segmentSpacing, 1)
+				previousDir = dir
+			end
+		end
+
+		storm.rootVelocity = Vector3.zero
+		if dt > 0.0001 then
+			storm.rootVelocity = (storm.root.Position - storm.lastRootPosition) / dt
+		end
+		storm.lastRootPosition = storm.root.Position
+	end
+
+	local function updateStormDuelMotion(t, dt)
+		local duel = storm.duel
+		if not duel or duel.resolved then
+			return nil
+		end
+
+		local partner = getStormById((duel.partnerIdA == storm.id) and duel.partnerIdB or duel.partnerIdA)
+		if not partner or partner.destroyed or not partner.model or not partner.model.Parent then
+			duel.resolved = true
+			storm.duel = nil
+			storm.duelSide = nil
+			return nil
+		end
+
+		local elapsed = t - (duel.startedAt or t)
+		local offset = storm.root.Position - partner.root.Position
+		local distance = offset.Magnitude
+
+		local away = safeUnit(offset)
+		if away == Vector3.zero then
+			away = randomFlatDirection(storm.rng)
+		end
+
+		local tangent = Vector3.new(-away.Z, 0, away.X)
+		if storm.duelSide == -1 then
+			tangent = -tangent
+		end
+
+		local orbitSpeed = math.clamp(
+			((storm.current.moveSpeed or 10) + (partner.current.moveSpeed or 10)) * 2.1
+				+ elapsed * 26
+				+ ((storm.current.spinSpeed or 6) + (partner.current.spinSpeed or 6)) * 10,
+			120,
+			550
+		)
+
+		local pullTight = math.clamp(
+			((storm.current.pullZone or 100) + (partner.current.pullZone or 100)) * 0.10
+				+ elapsed * 12,
+			20,
+			220
+		)
+
+		local lift = math.clamp(
+			((storm.current.axisClimb or 80) + (partner.current.axisClimb or 80)) * 0.35
+				+ elapsed * 8,
+			40,
+			220
+		)
+
+		local orbitalVelocity = tangent * orbitSpeed - away * pullTight + Vector3.new(0, lift, 0)
+		duel.chaos = (duel.chaos or 0) + dt * (distance < 1200 and 0.35 or 0.15) + (orbitSpeed / 500) * dt
+
+		local resolveDistance = math.max((storm.current.topWidth or 0), (partner.current.topWidth or 0)) * 0.18 + 240
+		local forceResolve = elapsed >= (duel.resolveAt or (duel.startedAt + 4.0)) or distance <= resolveDistance or duel.chaos >= 1.55
+
+		if forceResolve and not duel.resolved then
+			local mergeChance = math.clamp(
+				0.33
+					+ math.min((storm.current.windField or 0) + (partner.current.windField or 0), 5000) / 9000
+					+ math.min((storm.current.topWidth or 0) + (partner.current.topWidth or 0), 4096) / 9000
+				- (duel.chaos * 0.12),
+				0.15,
+				0.82
+			)
+
+			if storm.rng:NextNumber() < mergeChance then
+				endStormDuelWithMerge(storm, partner, duel)
+				return nil
+			else
+				endStormDuelWithRelease(storm, partner, duel)
+				return nil
+			end
+		end
+
+		return orbitalVelocity
+	end
+
+	local function updateWindField(dt, t)
+		local broadCenter = storm.root.Position + Vector3.new(0, storm.funnelHeight * 0.5, 0)
+		local broadSize = Vector3.new(current.windField * 4 + current.topWidth, storm.funnelHeight + 250, current.windField * 4 + current.topWidth)
+		local partsInRange = Workspace:GetPartBoundsInBox(CFrame.new(broadCenter), broadSize, storm.overlapParams)
+
+		local seenRoots = {}
+		local seenStructureModels = {}
+
+		for _, part in ipairs(partsInRange) do
+			if not part or not part:IsA("BasePart") then
+				continue
+			end
+			if shouldIgnoreWindPart(part) then
+				continue
+			end
+
+			local assemblyRoot = part.AssemblyRootPart
+			if not assemblyRoot or not assemblyRoot:IsA("BasePart") then
+				continue
+			end
+			if shouldIgnoreWindPart(assemblyRoot) then
+				continue
+			end
+			if seenRoots[assemblyRoot] then
+				continue
+			end
+			seenRoots[assemblyRoot] = true
+
+			local characterModel, humanoid = getCharacterModelFromRoot(assemblyRoot)
+			local isCharacter = humanoid ~= nil
+
+			if characterModel and humanoid and not deathConnections[characterModel] then
+				deathConnections[characterModel] = humanoid.Died:Connect(function()
+					setCharacterTornadoFreeze(characterModel, humanoid, false)
+					ragdollCharacterOnDeath(characterModel)
+				end)
+			end
+
+			local state = storm.windStates[assemblyRoot]
+
+			if state then
+				local centerPoint, _, funnelRadius = getTornadoFrameAtHeight(state.anchorHeight or 0)
+				local distance = (assemblyRoot.Position - centerPoint).Magnitude
+
+				if distance > (math.max(funnelRadius * 7, current.windField * 1.5)) then
+					if isCharacter and characterModel then
+						setCharacterTornadoFreeze(characterModel, humanoid, false)
+					end
+					storm.windStates[assemblyRoot] = nil
+					state = nil
+				end
+			end
+
+			if not state then
+				local centerPoint, tangent, funnelRadius = getClosestPointOnTornado(assemblyRoot.Position)
+				local offset = assemblyRoot.Position - centerPoint
+				local distance = offset.Magnitude
+
+				local influenceRadius = math.max(funnelRadius * 5, current.windField)
+
+				if distance <= influenceRadius then
+					local axisDir = safeUnit(tangent)
+					if axisDir == Vector3.zero then
+						axisDir = WORLD_UP
+					end
+
+					if assemblyRoot.Anchored and not isCharacter then
+						local structureModel = assemblyRoot:FindFirstAncestorOfClass("Model")
+						if structureModel and not structureModel:FindFirstChildOfClass("Humanoid") and not isInsideWhitelistedFolder(structureModel) then
+							local currentBest = seenStructureModels[structureModel]
+							if not currentBest or distance < currentBest.distance then
+								seenStructureModels[structureModel] = {
+									centerPoint = centerPoint,
+									axisDir = axisDir,
+									funnelRadius = funnelRadius,
+									distance = distance,
+								}
+							end
+						end
+						continue
+					end
+
+					storm.windStates[assemblyRoot] = storm.windStates[assemblyRoot] or {}
+
+					if isCharacter and characterModel then
+						local exposure = probeShelterExposure(characterModel, assemblyRoot)
+						if exposure.Enclosed and not exposure.GapOpen then
+							continue
+						end
+
+						local toTornado = centerPoint - assemblyRoot.Position
+						local pullDir = safeUnit(toTornado)
+						if pullDir == Vector3.zero then
+							pullDir = WORLD_UP
+						end
+
+						local swirlDir = safeUnit(tangent:Cross(pullDir))
+						if swirlDir == Vector3.zero then
+							swirlDir = Vector3.new(1, 0, 0)
+						end
+
+						local targetVelocity
+						if storm.hugeMode then
+							targetVelocity = pullDir * math.clamp(distance * 4.5, 28, current.pullZone) + Vector3.new(0, math.clamp((centerPoint.Y - assemblyRoot.Position.Y) * 2.2 + 55, 55, 220), 0) + storm.rootVelocity
+						elseif exposure.GapOpen then
+							local gapDir = safeUnit(exposure.GapDir)
+							if gapDir == Vector3.zero then
+								gapDir = pullDir
+							end
+							local gapPullSpeed = math.clamp(40 + exposure.GapDistance * 2.0 + current.windField * 0.18, 40, current.windField * 1.4)
+							targetVelocity =
+								(gapDir * gapPullSpeed)
+								+ (pullDir * math.clamp(distance * 2.5, 20, current.pullZone))
+								+ (swirlDir * 38)
+								+ Vector3.new(0, math.clamp(25 + current.axisClimb * 0.15, 25, 140), 0)
+								+ storm.rootVelocity
+						else
+							local pullSpeed = math.clamp(distance * 5.0, 28, current.pullZone)
+							local lift = math.clamp((centerPoint.Y - assemblyRoot.Position.Y) * 2.6 + 60, 60, 260)
+							targetVelocity =
+								(pullDir * pullSpeed)
+								+ (swirlDir * 38)
+								+ Vector3.new(0, lift, 0)
+								+ storm.rootVelocity
+						end
+
+						targetVelocity = clampVectorMagnitude(targetVelocity, WIND_MAX_CHARACTER_SPEED)
+						applyVelocityToCharacter(characterModel, targetVelocity, Vector3.zero)
+						setCharacterTornadoFreeze(characterModel, humanoid, true)
+						armFallDamage(assemblyRoot, humanoid, characterModel)
+					else
+						local pullDir = safeUnit(centerPoint - assemblyRoot.Position)
+						if pullDir == Vector3.zero then
+							pullDir = WORLD_UP
+						end
+
+						local targetVelocity
+						if storm.hugeMode then
+							targetVelocity = pullDir * math.clamp(distance * 4.5, 28, current.pullZone) + Vector3.new(0, math.clamp((centerPoint.Y - assemblyRoot.Position.Y) * 2.2 + 55, 55, 220), 0) + storm.rootVelocity
+						else
+							local swirlDir = safeUnit(tangent:Cross(pullDir))
+							if swirlDir == Vector3.zero then
+								swirlDir = Vector3.new(1, 0, 0)
+							end
+							local pullSpeed = math.clamp(distance * 5.0, 28, current.pullZone)
+							local lift = math.clamp((centerPoint.Y - assemblyRoot.Position.Y) * 2.6 + 60, 60, 260)
+							targetVelocity =
+								(pullDir * pullSpeed)
+								+ (swirlDir * 38)
+								+ Vector3.new(0, lift, 0)
+								+ storm.rootVelocity
+						end
+
+						targetVelocity = clampVectorMagnitude(targetVelocity, WIND_MAX_OBJECT_SPEED)
+						applyVelocityToAssembly(assemblyRoot, targetVelocity, Vector3.zero)
+					end
+				else
+					if isCharacter and characterModel then
+						setCharacterTornadoFreeze(characterModel, humanoid, false)
+					end
+					storm.windStates[assemblyRoot] = nil
+				end
+			end
+
+			local state = storm.windStates[assemblyRoot]
+			if state and not storm.hugeMode then
+				local orbitCenterPoint, axisDir, funnelRadius = getTornadoFrameAtHeight(state.anchorHeight or 0)
+				local centerVelocity = Vector3.zero
+				if state.lastCenterPoint and dt > 0.0001 then
+					centerVelocity = (orbitCenterPoint - state.lastCenterPoint) / dt
+				end
+				state.lastCenterPoint = orbitCenterPoint
+
+				state.axisDir = safeUnit((state.axisDir or axisDir):Lerp(axisDir, math.clamp(dt * 6, 0, 1)))
+				if state.axisDir == Vector3.zero then
+					state.axisDir = axisDir
+				end
+
+				local offsetFromAxis = assemblyRoot.Position - orbitCenterPoint
+				state.basis1, state.basis2 = buildOrbitBasis(state.axisDir, state.basis1, offsetFromAxis)
+
+				local orbitRadiusTarget = math.max(funnelRadius * 0.95, state.radius or funnelRadius)
+				state.radius = (state.radius or orbitRadiusTarget) + (orbitRadiusTarget - (state.radius or orbitRadiusTarget)) * math.clamp(dt * 3, 0, 1)
+
+				state.anchorHeight = math.clamp((state.anchorHeight or 0) + math.clamp(30 + (current.axisClimb * 0.5), 20, 95) * dt, 0, storm.funnelHeight)
+
+				local climbAxisPoint, climbAxisDir = getTornadoFrameAtHeight(state.anchorHeight)
+				state.axisDir = safeUnit(state.axisDir:Lerp(climbAxisDir, math.clamp(dt * 4, 0, 1)))
+				if state.axisDir == Vector3.zero then
+					state.axisDir = climbAxisDir
+				end
+
+				state.basis1, state.basis2 = buildOrbitBasis(state.axisDir, state.basis1, assemblyRoot.Position - climbAxisPoint)
+
+				state.angularSpeed = state.angularSpeed or current.spinSpeed
+				state.angularSpeed = state.angularSpeed + (((current.spinSpeed + 1.5) * (state.spinDir or 1)) - state.angularSpeed) * math.clamp(dt * 2.5, 0, 1)
+				state.orbitAngle = (state.orbitAngle or 0) + state.angularSpeed * dt
+
+				local cosine = math.cos(state.orbitAngle)
+				local sine = math.sin(state.orbitAngle)
+
+				local desiredPos =
+					climbAxisPoint
+					+ state.basis1 * cosine * state.radius
+					+ state.basis2 * sine * state.radius
+
+				local offsetToDesired = desiredPos - assemblyRoot.Position
+				local planarOffset = offsetToDesired - state.axisDir * offsetToDesired:Dot(state.axisDir)
+				local planarDist = planarOffset.Magnitude
+				local planarDir = planarDist > 0.001 and planarOffset.Unit or state.basis1
+
+				local orbitTangent = state.axisDir:Cross(planarDir)
+				if orbitTangent.Magnitude < 0.001 then
+					orbitTangent = state.basis2
+				end
+				orbitTangent = orbitTangent.Unit * (state.spinDir or 1)
+
+				local tangentialSpeed = math.max((state.angularSpeed or 0) * state.radius, 65)
+				local radialCorrection = planarDir * math.clamp(planarDist * 24, -120, 120)
+				local axisClimbForce = state.axisDir * math.clamp((current.axisClimb * 0.6) + (funnelRadius * 0.05), 20, 110)
+
+				local targetVelocity =
+					orbitTangent * tangentialSpeed
+					+ radialCorrection
+					+ axisClimbForce
+					+ centerVelocity
+					+ storm.rootVelocity * 0.25
+
+				if isCharacter then
+					targetVelocity = clampVectorMagnitude(targetVelocity, WIND_MAX_CHARACTER_SPEED)
+					if characterModel then
+						applyVelocityToCharacter(characterModel, targetVelocity, Vector3.new(0, (state.angularSpeed or 0) * (state.spinDir or 1), 0))
+					else
+						applyVelocityToAssembly(assemblyRoot, targetVelocity, Vector3.new(0, (state.angularSpeed or 0) * (state.spinDir or 1), 0))
+					end
+					setCharacterTornadoFreeze(characterModel, humanoid, true)
+					armFallDamage(assemblyRoot, humanoid, characterModel)
+				else
+					targetVelocity = clampVectorMagnitude(targetVelocity, WIND_MAX_OBJECT_SPEED)
+					applyVelocityToAssembly(assemblyRoot, targetVelocity, Vector3.new(0, (state.angularSpeed or 0) * (state.spinDir or 1), 0))
+				end
+
+				local heightAboveBase = climbAxisPoint.Y - (storm.root.Position.Y + rootTouchHeight)
+				if heightAboveBase > math.max(220, storm.funnelHeight * 0.78) then
+					state.phase = "eject"
+					state.ejectTime = 0
+
+					local radialInPlane = assemblyRoot.Position - climbAxisPoint
+					local radial = radialInPlane - state.axisDir * radialInPlane:Dot(state.axisDir)
+
+					state.ejectDir = safeUnit(radial)
+					if state.ejectDir == Vector3.zero then
+						state.ejectDir = safeUnit(state.basis1)
+					end
+					if state.ejectDir == Vector3.zero then
+						state.ejectDir = Vector3.new(1, 0, 0)
+					end
+				end
+
+				if state.phase == "eject" then
+					state.ejectTime += dt
+					local ejectDir = state.ejectDir or Vector3.new(1, 0, 0)
+					local upward = math.max(110 - (state.ejectTime * 18), 55)
+					local sideways = 170
+					local tumble = state.axisDir * 35
+					local targetVelocity = ejectDir * sideways + state.axisDir * upward + tumble + centerVelocity + storm.rootVelocity
+
+					if isCharacter then
+						targetVelocity = clampVectorMagnitude(targetVelocity, WIND_MAX_CHARACTER_SPEED + 80)
+						if characterModel then
+							applyVelocityToCharacter(characterModel, targetVelocity, Vector3.new(0, (state.angularSpeed or 0) * (state.spinDir or 1), 0))
+						else
+							applyVelocityToAssembly(assemblyRoot, targetVelocity, Vector3.new(0, (state.angularSpeed or 0) * (state.spinDir or 1), 0))
+						end
+						setCharacterTornadoFreeze(characterModel, humanoid, true)
+					else
+						targetVelocity = clampVectorMagnitude(targetVelocity, WIND_MAX_OBJECT_SPEED + 40)
+						applyVelocityToAssembly(assemblyRoot, targetVelocity, Vector3.new(0, (state.angularSpeed or 0) * (state.spinDir or 1), 0))
+						scheduleThrownDestroy(assemblyRoot)
+					end
+				end
+			end
+		end
+
+		for structureModel, info in pairs(seenStructureModels) do
+			local state = storm.structureStates[structureModel]
+			if not state then
+				state = {
+					queue = {},
+					queueIndex = 1,
+					progress = 0,
+					lastRefresh = os.clock(),
+					lastSeen = os.clock(),
+					centerPoint = info.centerPoint,
+					axisDir = info.axisDir,
+					funnelRadius = info.funnelRadius,
+				}
+
+				for _, inst in ipairs(structureModel:GetDescendants()) do
+					if inst:IsA("BasePart") and inst.Anchored and not shouldIgnoreWindPart(inst) and inst.Name ~= "HumanoidRootPart" then
+						table.insert(state.queue, inst)
+					end
+				end
+
+				table.sort(state.queue, function(a, b)
+					return (a.Position - info.centerPoint).Magnitude < (b.Position - info.centerPoint).Magnitude
+				end)
+
+				storm.structureStates[structureModel] = state
+			end
+
+			state.lastSeen = os.clock()
+			state.centerPoint = info.centerPoint
+			state.axisDir = info.axisDir
+			state.funnelRadius = info.funnelRadius
+			state.progress += dt * (current.mph / 33.3333333333)
+
+			while state.progress >= 1 do
+				local part = nil
+
+				while state.queueIndex <= #state.queue do
+					local candidate = state.queue[state.queueIndex]
+					state.queueIndex += 1
+					if candidate and candidate.Parent and candidate:IsA("BasePart") and candidate.Anchored and not shouldIgnoreWindPart(candidate) then
+						part = candidate
+						break
+					end
+				end
+
+				if not part then
+					state.queue = {}
+					for _, inst in ipairs(structureModel:GetDescendants()) do
+						if inst:IsA("BasePart") and inst.Anchored and not shouldIgnoreWindPart(inst) and inst.Name ~= "HumanoidRootPart" then
+							table.insert(state.queue, inst)
+						end
+					end
+
+					table.sort(state.queue, function(a, b)
+						return (a.Position - state.centerPoint).Magnitude < (b.Position - state.centerPoint).Magnitude
+					end)
+
+					state.queueIndex = 1
+					state.progress = 0
+					break
+				end
+
+				state.progress -= 1
+
+				local centerPoint = state.centerPoint or info.centerPoint or storm.root.Position
+				local axisDir = safeUnit(state.axisDir or info.axisDir or WORLD_UP)
+				if axisDir == Vector3.zero then
+					axisDir = WORLD_UP
+				end
+
+				local toCenter = centerPoint - part.Position
+				local pullDir = safeUnit(toCenter)
+				if pullDir == Vector3.zero then
+					pullDir = WORLD_UP
+				end
+
+				local swirlDir = safeUnit(axisDir:Cross(pullDir))
+				if swirlDir == Vector3.zero then
+					swirlDir = Vector3.new(1, 0, 0)
+				end
+
+				local distance = toCenter.Magnitude
+				local pullSpeed = math.clamp(35 + distance * 4 + (55 + current.mph * 0.9), 35, 500)
+				local liftSpeed = math.clamp(25 + (35 + current.mph * 0.25) + (centerPoint.Y - part.Position.Y) * 0.9, 20, 350)
+
+				local targetVelocity = pullDir * pullSpeed + swirlDir * (30 + current.mph * 0.2) + Vector3.new(0, liftSpeed, 0) + storm.rootVelocity
+				targetVelocity = clampVectorMagnitude(targetVelocity, 500 + current.mph * 2)
+
+				part.Anchored = false
+				part.Massless = false
+				part.AssemblyLinearVelocity = targetVelocity
+				part.AssemblyAngularVelocity = Vector3.new(0, 12 + (current.mph * 0.08), 0)
+				scheduleThrownDestroy(part)
+			end
+		end
+	end
+
+	local function step(dt)
+		if not storm.model.Parent then
+			destroyStorm(storm)
+			return false
+		end
+
+		local t = os.clock() - storm.startTime
+
+		if os.clock() >= storm.deathTime then
+			destroyStorm(storm)
+			return false
+		end
+
+		local dueling = storm.duel and not storm.duel.resolved
+		local duelVelocity = nil
+		if dueling then
+			duelVelocity = updateStormDuelMotion(t, dt)
+			if storm.destroyed or not storm.model.Parent then
+				return false
+			end
+		end
+
+		updateDynamicStats(t, dt)
+		retargetMovement(t)
+
+		local desiredHorizontal = Vector3.new(storm.moveDir.X, 0, storm.moveDir.Z)
+		if desiredHorizontal.Magnitude < 0.01 then
+			desiredHorizontal = Vector3.new(1, 0, 0)
+		end
+		desiredHorizontal = desiredHorizontal.Unit
+
+		local motionVelocity
+		if dueling and duelVelocity then
+			motionVelocity = duelVelocity
+		else
+			motionVelocity = desiredHorizontal * current.moveSpeed + storm.launchVelocity
+		end
+
+		local proposedPos = storm.root.Position + motionVelocity * dt
+		local groundY = getGroundYAtPosition(proposedPos, storm.model)
+
+		if groundY then
+			local deltaGround = math.abs(groundY - storm.currentGroundY)
+			if deltaGround <= GROUND_MAX_STEP or dueling then
+				storm.currentGroundY = groundY
+				storm.root.Position = Vector3.new(proposedPos.X, storm.currentGroundY, proposedPos.Z)
+			else
+				storm.moveTargetDir = randomFlatDirection(rng)
+				storm.root.Position = Vector3.new(storm.root.Position.X, storm.currentGroundY, storm.root.Position.Z)
+			end
+		else
+			storm.moveTargetDir = randomFlatDirection(rng)
+			storm.root.Position = Vector3.new(storm.root.Position.X, storm.currentGroundY, storm.root.Position.Z)
+		end
+
+		storm.launchVelocity = storm.launchVelocity * math.clamp(1 - (dt * 0.18), 0, 1)
+
+		local rootVelocity = Vector3.zero
+		if dt > 0.0001 then
+			rootVelocity = (storm.root.Position - storm.lastRootPosition) / dt
+		end
+		storm.rootVelocity = rootVelocity
+		storm.lastRootPosition = storm.root.Position
+
+		if not dueling then
+			local partner = findInteractionPartner(storm)
+			if partner then
+				beginStormDuel(storm, partner, t)
+			end
+		end
+
+		updateFormationAndVisuals(t, dt)
+		updateWindField(dt, t)
+		updatePendingFallDamage()
+		updateVortices(dt, t)
+
+		return true
+	end
+
+	local conn
+	conn = RunService.Heartbeat:Connect(function(dt)
+		if not step(dt) then
+			if conn then
+				conn:Disconnect()
+			end
+		end
+	end)
+
+	task.delay(base.lifetime + 0.25, function()
+		if storm.model and storm.model.Parent then
+			destroyStorm(storm)
+		end
+	end)
+end
+
+local function beginSpawner()
+	if spawned then
+		return
+	end
+	spawned = true
+
+	task.spawn(function()
+		local rng = Random.new(math.floor(os.clock() * 1000000) % 2147483647)
+		task.wait(sampleSpawnInterval(rng))
+		while true do
+			local settings = makeTornadoSettings(rng, false)
+			local spawnPoint = chooseNaturalSpawnPoint(rng)
+			spawnTornado(spawnPoint, settings)
+			task.wait(sampleSpawnInterval(rng))
+		end
+	end)
+end
+
+local function queueTestStorm()
+	if testStormQueued then
+		return
+	end
+	testStormQueued = true
+
+	task.spawn(function()
+		local rng = Random.new(math.floor(os.clock() * 1000000) % 2147483647)
+		task.wait(rng:NextNumber(CONFIG.TestStormSpawnDelayMin, CONFIG.TestStormSpawnDelayMax))
+		local settings = makeTornadoSettings(rng, true)
+		local spawnPoint = chooseNaturalSpawnPoint(rng)
+		spawnTornado(spawnPoint, settings)
+	end)
+end
+
+Players.PlayerAdded:Connect(function()
+	beginSpawner()
+	queueTestStorm()
+end)
+
+if #Players:GetPlayers() > 0 then
+	task.defer(function()
+		beginSpawner()
+		queueTestStorm()
+	end)
+else
+	beginSpawner()
+end

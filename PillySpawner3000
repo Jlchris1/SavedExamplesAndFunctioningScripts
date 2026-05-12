@@ -1,0 +1,2609 @@
+-- VillagerTradeServer_v11.lua
+-- Put this Script in ServerScriptService.
+-- Requires:
+--   ServerStorage/VillagerTemplates (Folder with Models)
+--   ServerStorage/SnowWorldTradables (Folder with Tools)
+--   ServerStorage/VillagerWeapons (Folder with Tools)
+
+local Players = game:GetService("Players")
+local ServerStorage = game:GetService("ServerStorage")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local TRADE_REMOTE_NAME = "VillagerTradeRemote"
+local CARRY_REMOTE_NAME = "VillagerCarryRemote"
+local VILLAGER_FOLDER_NAME = "SnowWorldVillagers"
+local VILLAGER_WEAPONS_FOLDER_NAME = "VillagerWeapons"
+local COIN_VALUE_NAME = "Coins"
+
+local MAX_ITEMS_PER_VILLAGER = 6
+local BASE_SPAWN_INTERVAL = 1
+local BASE_MAX_ACTIVE_VILLAGERS = 150
+
+local MIN_LIFETIME = 600
+local MAX_LIFETIME = 900
+
+local ZOMBIE_DETECTION_RADIUS = 500
+local MONSTER_ASSIST_RADIUS = 160
+local RETALIATE_RADIUS = 500
+local DEATH_DESPAWN_DELAY = 5
+local THREAT_WINDOW = 2.5
+local COMBAT_MAX_DURATION = 20
+local ZOMBIE_CACHE_REFRESH = 1.25
+local HEALTH_POLL_INTERVAL = 1
+local WEAPON_EQUIP_DELAY = 0.12
+
+local ROAD_CACHE_REFRESH = 2.0
+local VILLAGER_NEAR_CACHE_REFRESH = 1.5
+local MOVE_BATCH_PER_TICK = 10
+local MOVE_TICK_DELAY = 0.35
+
+local CHILD_SPAWN_CHANCE = 0.22
+local BABY_SPAWN_CHANCE = 0.12
+local CHILD_SCALE = 0.75
+local BABY_SCALE = 0.48
+
+local CARRY_FRONT_OFFSET = CFrame.new(0, 4.1, -2.2)
+local THROW_VELOCITY = 280
+local THROW_PLATFORMSTAND_TIME = 5
+local THROW_GROUND_BASE_DAMAGE = 50
+local THROW_GROUND_DAMAGE_SCALE = 1.0
+local THROW_WALL_KILL_MIN_SPEED = 18
+local THROW_GRACE_TIME = 0.18
+local THROW_SPLASH_VELOCITY = 150
+local THROW_HIGHLIGHT_DURATION = 10
+
+local RARITY_ORDER = {
+	common = 1,
+	uncommon = 2,
+	rare = 3,
+	epic = 4,
+	legendary = 5,
+	mythical = 6,
+	secret = 7,
+	divine = 8,
+}
+
+local RARITY_COLORS = {
+	common = Color3.fromRGB(255, 255, 255),
+	uncommon = Color3.fromRGB(70, 255, 90),
+	rare = Color3.fromRGB(70, 130, 255),
+	epic = Color3.fromRGB(180, 80, 255),
+	legendary = Color3.fromRGB(255, 230, 80),
+	mythical = Color3.fromRGB(255, 70, 70),
+	secret = Color3.fromRGB(0, 0, 0),
+	divine = Color3.fromRGB(255, 255, 255),
+}
+
+local DEFAULT_ANIM_IDS = {
+	R15 = {
+		idle1 = 507766666,
+		idle2 = 507766951,
+		walk = 507777826,
+		run = 507767714,
+		jump = 507765000,
+		fall = 507767968,
+		climb = 507765644,
+		swim = 507784897,
+		swimidle = 507785072,
+		toolhold = 507768375,
+	},
+	R6 = {
+		idle1 = 180435571,
+		idle2 = 180435792,
+		walk = 180426354,
+		run = 180426354,
+		jump = 125750702,
+		fall = 180436148,
+		climb = 180436334,
+		swim = 180426354,
+		swimidle = 180435792,
+		toolhold = 182393478,
+	},
+}
+
+local MALE_NAMES = {
+	"Egort", "Jimmy", "Milo", "Benn", "Otis", "Lenn", "Pip", "Arlo", "Cade", "Dorian",
+	"Finn", "Gavin", "Hugo", "Ivo", "Jasper", "Kellan", "Luca", "Merrit", "Nolan", "Orin",
+	"Perry", "Quinn", "Ronan", "Soren", "Tobin", "Ulric", "Venn", "Wes", "Yorin", "Zed"
+}
+
+local FEMALE_NAMES = {
+	"Anya", "Bella", "Cora", "Della", "Elsie", "Faye", "Gwen", "Hazel", "Ivy", "Juno",
+	"Kira", "Lina", "Mara", "Nia", "Opal", "Pia", "Quella", "Rina", "Sage", "Tessa",
+	"Una", "Vera", "Willa", "Yara", "Zuri"
+}
+
+local BABY_NAMES = {
+	"Bean", "Pip", "Mimi", "Tiny", "Boo", "Toto", "Bibi", "Nini", "Poppy", "Lulu",
+	"Roo", "Muffin", "Peep", "Didi", "Kiki"
+}
+
+local villagerTemplates = ServerStorage:FindFirstChild("VillagerTemplates")
+local tradablesFolder = ServerStorage:FindFirstChild("SnowWorldTradables")
+local villagerWeaponsFolder = ServerStorage:FindFirstChild(VILLAGER_WEAPONS_FOLDER_NAME)
+
+if not villagerTemplates then
+	warn("[VillagerTrade] ServerStorage.VillagerTemplates is missing.")
+	return
+end
+
+if not tradablesFolder then
+	warn("[VillagerTrade] ServerStorage.SnowWorldTradables is missing.")
+	return
+end
+
+if not villagerWeaponsFolder then
+	warn("[VillagerTrade] ServerStorage.VillagerWeapons is missing.")
+	return
+end
+
+local villagerFolder = workspace:FindFirstChild(VILLAGER_FOLDER_NAME)
+if not villagerFolder then
+	villagerFolder = Instance.new("Folder")
+	villagerFolder.Name = VILLAGER_FOLDER_NAME
+	villagerFolder.Parent = workspace
+end
+
+local tradeRemote = ReplicatedStorage:FindFirstChild(TRADE_REMOTE_NAME)
+if not tradeRemote then
+	tradeRemote = Instance.new("RemoteEvent")
+	tradeRemote.Name = TRADE_REMOTE_NAME
+	tradeRemote.Parent = ReplicatedStorage
+end
+
+local carryRemote = ReplicatedStorage:FindFirstChild(CARRY_REMOTE_NAME)
+if not carryRemote then
+	carryRemote = Instance.new("RemoteEvent")
+	carryRemote.Name = CARRY_REMOTE_NAME
+	carryRemote.Parent = ReplicatedStorage
+end
+
+local ReputationService
+do
+	local ok, mod = pcall(function()
+		local module = ServerScriptService:FindFirstChild("ReputationService")
+		if module and module:IsA("ModuleScript") then
+			return require(module)
+		end
+		return nil
+	end)
+	if ok then
+		ReputationService = mod
+	end
+end
+
+ReputationService = ReputationService or {}
+ReputationService.Start = ReputationService.Start or function() end
+ReputationService.Get = ReputationService.Get or function()
+	return 0
+end
+ReputationService.GetDiscountMultiplier = ReputationService.GetDiscountMultiplier or function()
+	return 1
+end
+ReputationService.GetWorldModifiers = ReputationService.GetWorldModifiers or function()
+	return {
+		Rep = 0,
+		SpawnMultiplier = 1,
+		CapMultiplier = 1,
+		Chaos = false,
+		Hunted = false,
+		Embodiment = false,
+	}
+end
+ReputationService.RegisterTrade = ReputationService.RegisterTrade or function() end
+ReputationService.RegisterVillagerKill = ReputationService.RegisterVillagerKill or function() end
+ReputationService.MarkVillagerAggro = ReputationService.MarkVillagerAggro or function() end
+
+pcall(function()
+	ReputationService.Start()
+end)
+
+local Villagers = {}
+local VillagerOrder = {}
+local MovementCursor = 1
+local RecentPlayerThreats = {}
+local ToolConnections = {}
+local CarryStateByPlayer = {}
+
+local RoadCache = { List = {}, LastRefresh = 0, IndexByPart = {} }
+local ZombieCache = { Models = {}, LastRefresh = 0 }
+local NearbyVillagerCache = { List = {}, LastRefresh = 0 }
+
+local startAttackLoop
+local startSupportBurst
+local onVillagerKilled
+
+local function getRoadParts()
+	local now = os.clock()
+	if now - RoadCache.LastRefresh < ROAD_CACHE_REFRESH and #RoadCache.List > 0 then
+		return RoadCache.List
+	end
+
+	table.clear(RoadCache.List)
+	table.clear(RoadCache.IndexByPart)
+
+	local seen = {}
+
+	local function scan(container)
+		if not container then
+			return
+		end
+		for _, inst in ipairs(container:GetDescendants()) do
+			if inst:IsA("BasePart") and inst.Name == "SnowWorldMudRoad" and not seen[inst] then
+				seen[inst] = true
+				table.insert(RoadCache.List, inst)
+			end
+		end
+	end
+
+	local whitelisted = workspace:FindFirstChild("Whitelisted")
+	if whitelisted then
+		local snowWorld = whitelisted:FindFirstChild("SnowWorld")
+		if snowWorld then
+			scan(snowWorld:FindFirstChild("MudRoads"))
+		end
+	end
+
+	scan(workspace)
+
+	table.sort(RoadCache.List, function(a, b)
+		return a:GetFullName() < b:GetFullName()
+	end)
+
+	for i, road in ipairs(RoadCache.List) do
+		RoadCache.IndexByPart[road] = i
+	end
+
+	RoadCache.LastRefresh = now
+	return RoadCache.List
+end
+
+local function randomRoadPart()
+	local roads = getRoadParts()
+	if #roads == 0 then
+		return nil
+	end
+	return roads[math.random(1, #roads)]
+end
+
+local function getDifferentRoadPart(excludePart)
+	local roads = getRoadParts()
+	if #roads == 0 then
+		return nil
+	end
+	if #roads == 1 then
+		return roads[1]
+	end
+
+	local excludeIndex = excludePart and RoadCache.IndexByPart[excludePart] or nil
+	if excludeIndex then
+		local offset = math.random(1, math.min(4, #roads - 1))
+		local idx = ((excludeIndex - 1 + offset) % #roads) + 1
+		local candidate = roads[idx]
+		if candidate ~= excludePart and candidate.Parent then
+			return candidate
+		end
+	end
+
+	local candidates = {}
+	for _, road in ipairs(roads) do
+		if road ~= excludePart and road.Parent then
+			table.insert(candidates, road)
+		end
+	end
+
+	if #candidates == 0 then
+		return roads[math.random(1, #roads)]
+	end
+
+	return candidates[math.random(1, #candidates)]
+end
+
+local function getRandomPointOnRoad(roadPart)
+	if not roadPart then
+		return nil
+	end
+	local yOffset = (roadPart.Size.Y * 0.5) + 2
+	local x = (math.random() - 0.5) * math.max(2, roadPart.Size.X * 0.32)
+	local z = (math.random() - 0.5) * math.max(2, roadPart.Size.Z * 0.32)
+	return (roadPart.CFrame * CFrame.new(x, yOffset, z)).Position
+end
+
+local function getCoinValue(player)
+	local leaderstats = player:FindFirstChild("leaderstats")
+	if leaderstats then
+		local coins = leaderstats:FindFirstChild(COIN_VALUE_NAME)
+		if coins and (coins:IsA("IntValue") or coins:IsA("NumberValue")) then
+			return coins
+		end
+	end
+
+	local direct = player:FindFirstChild(COIN_VALUE_NAME)
+	if direct and (direct:IsA("IntValue") or direct:IsA("NumberValue")) then
+		return direct
+	end
+
+	return nil
+end
+
+local function getNumericCost(tool)
+	for _, name in ipairs({ "Cost", "Price" }) do
+		local found = tool:FindFirstChild(name, true)
+		if found and (found:IsA("StringValue") or found:IsA("IntValue") or found:IsA("NumberValue")) then
+			return tonumber(found.Value) or 1
+		end
+	end
+	return 1
+end
+
+local function getExplicitRarity(tool)
+	for _, rarity in ipairs({ "Divine", "Secret", "Mythical", "Legendary" }) do
+		if tool:FindFirstChild(rarity, true) then
+			return string.lower(rarity)
+		end
+	end
+	return nil
+end
+
+local function rarityFromCost(cost)
+	if cost >= 1000000 then
+		return "divine"
+	elseif cost >= 100000 then
+		return "secret"
+	elseif cost >= 10000 then
+		return "mythical"
+	elseif cost >= 1000 then
+		return "legendary"
+	elseif cost >= 401 then
+		return "epic"
+	elseif cost >= 191 then
+		return "rare"
+	elseif cost >= 91 then
+		return "uncommon"
+	else
+		return "common"
+	end
+end
+
+local function listTradableTools()
+	local tools = {}
+	for _, inst in ipairs(tradablesFolder:GetChildren()) do
+		if inst:IsA("Tool") then
+			table.insert(tools, inst)
+		end
+	end
+	return tools
+end
+
+local function getToolStats(tool)
+	local out = {}
+	local statsFolder = tool:FindFirstChild("Stats")
+	if not statsFolder then
+		return out
+	end
+	for _, v in ipairs(statsFolder:GetChildren()) do
+		if v:IsA("StringValue") or v:IsA("IntValue") or v:IsA("NumberValue") then
+			out[v.Name] = tostring(v.Value)
+		end
+	end
+	return out
+end
+
+local function weightForTool(tool)
+	local cost = math.max(1, getNumericCost(tool))
+	local explicit = getExplicitRarity(tool)
+
+	if explicit == "divine" then return 0.000002 end
+	if explicit == "secret" then return 0.00001 end
+	if explicit == "mythical" then return 0.00004 end
+	if explicit == "legendary" then return 0.0002 end
+	if explicit == "epic" then return 0.001 end
+	if explicit == "rare" then return 0.005 end
+	if explicit == "uncommon" then return 0.04 end
+
+	return 1 / (1 + (cost / 100))
+end
+
+local function pickWeightedTool(pool)
+	if #pool == 0 then
+		return nil
+	end
+
+	local total = 0
+	for _, tool in ipairs(pool) do
+		total += weightForTool(tool)
+	end
+
+	local roll = math.random() * math.max(total, 0.000001)
+	local running = 0
+	for _, tool in ipairs(pool) do
+		running += weightForTool(tool)
+		if roll <= running then
+			return tool
+		end
+	end
+
+	return pool[#pool]
+end
+
+local function rollSlotRarity()
+	local r = math.random(1, 500000)
+	if r == 1 then
+		return "divine"
+	elseif r <= 6 then
+		return "secret"
+	elseif r <= 26 then
+		return "mythical"
+	elseif r <= 126 then
+		return "legendary"
+	elseif r <= 626 then
+		return "epic"
+	elseif r <= 3126 then
+		return "rare"
+	elseif r <= 22326 then
+		return "uncommon"
+	else
+		return "common"
+	end
+end
+
+local function isToolEligibleForTier(tool, tier)
+	local explicit = getExplicitRarity(tool)
+	local cost = getNumericCost(tool)
+	local toolTier = explicit or rarityFromCost(cost)
+	return RARITY_ORDER[toolTier] and RARITY_ORDER[toolTier] <= RARITY_ORDER[tier]
+end
+
+local function buildVillagerItemList()
+	local pool = listTradableTools()
+	if #pool == 0 then
+		return {}
+	end
+
+	local slots = math.random(1, MAX_ITEMS_PER_VILLAGER)
+	local picked = {}
+	local used = {}
+
+	for _ = 1, slots do
+		local tier = rollSlotRarity()
+		local candidates = {}
+
+		for _, tool in ipairs(pool) do
+			if not used[tool] and isToolEligibleForTier(tool, tier) then
+				table.insert(candidates, tool)
+			end
+		end
+
+		if #candidates == 0 then
+			for _, tool in ipairs(pool) do
+				if not used[tool] then
+					table.insert(candidates, tool)
+				end
+			end
+		end
+
+		if #candidates == 0 then
+			break
+		end
+
+		local chosen = pickWeightedTool(candidates)
+		if chosen then
+			used[chosen] = true
+			local cost = getNumericCost(chosen)
+			local rarity = getExplicitRarity(chosen) or rarityFromCost(cost)
+			table.insert(picked, {
+				Id = HttpService:GenerateGUID(false),
+				ToolName = chosen.Name,
+				Cost = cost,
+				Rarity = rarity,
+				Stats = getToolStats(chosen),
+			})
+		end
+	end
+
+	return picked
+end
+
+local function getTemplateList()
+	local models = {}
+	for _, inst in ipairs(villagerTemplates:GetChildren()) do
+		if inst:IsA("Model") then
+			table.insert(models, inst)
+		end
+	end
+	return models
+end
+
+local function ensurePrimaryPart(model)
+	if model.PrimaryPart then
+		return
+	end
+	local hrp = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
+	if hrp then
+		model.PrimaryPart = hrp
+	end
+end
+
+local function getModelRootPart(model)
+	if not model then
+		return nil
+	end
+	return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+end
+
+local function getCharacterRoot(character)
+	if not character then
+		return nil
+	end
+	return character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
+end
+
+local function placeOnRoad(model, roadPart)
+	ensurePrimaryPart(model)
+	if not model.PrimaryPart then
+		return
+	end
+	local yOffset = (roadPart.Size.Y * 0.5) + (model.PrimaryPart.Size.Y * 0.5) + 0.1
+	local x = (math.random() - 0.5) * math.max(2, roadPart.Size.X * 0.32)
+	local z = (math.random() - 0.5) * math.max(2, roadPart.Size.Z * 0.32)
+	model:PivotTo(roadPart.CFrame * CFrame.new(x, yOffset, z))
+end
+
+local function addHighlight(model, color)
+	local h = Instance.new("Highlight")
+	h.Name = "VillagerHighlight"
+	h.Adornee = model
+	h.DepthMode = Enum.HighlightDepthMode.Occluded
+	h.FillTransparency = 0.6
+	h.OutlineTransparency = 0.1
+	h.FillColor = color
+	h.OutlineColor = color
+	h.Enabled = false
+	h.Parent = model
+	return h
+end
+
+local function setVillagerThrowHighlight(villagerId, enabled)
+	local data = Villagers[villagerId]
+	if not data or not data.Model or not data.Model.Parent then
+		return
+	end
+
+	local h = data.ThrowHighlight
+	if not h or not h.Parent then
+		h = data.Model:FindFirstChild("ThrownVillagerHighlight")
+		if not h or not h:IsA("Highlight") then
+			h = Instance.new("Highlight")
+			h.Name = "ThrownVillagerHighlight"
+			h.Adornee = data.Model
+			h.DepthMode = Enum.HighlightDepthMode.Occluded
+			h.FillTransparency = 0.25
+			h.OutlineTransparency = 0
+			h.FillColor = Color3.fromRGB(255, 255, 160)
+			h.OutlineColor = Color3.fromRGB(255, 255, 255)
+			h.Parent = data.Model
+		end
+		data.ThrowHighlight = h
+	end
+
+	h.Enabled = enabled and true or false
+end
+
+local function createPrompt(model, actionText, objectText, uiOffset)
+	local hrp = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+	if not hrp then
+		return nil
+	end
+
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = actionText .. "Prompt"
+	prompt.ActionText = actionText
+	prompt.ObjectText = objectText
+	prompt.KeyboardKeyCode = Enum.KeyCode.E
+	prompt.HoldDuration = 0
+	prompt.MaxActivationDistance = 12
+	prompt.RequiresLineOfSight = false
+	prompt.UIOffset = uiOffset or Vector2.new(0, 0)
+	prompt.Parent = hrp
+	return prompt
+end
+
+local function announceToAll(action, payload)
+	tradeRemote:FireAllClients(action, payload)
+end
+
+local function makeDivineShockwave(position)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanTouch = false
+	p.CanQuery = false
+	p.Shape = Enum.PartType.Ball
+	p.Material = Enum.Material.Neon
+	p.Color = Color3.fromRGB(255, 255, 255)
+	p.Transparency = 0.55
+	p.Size = Vector3.new(1, 1, 1)
+	p.CFrame = CFrame.new(position)
+	p.Parent = workspace
+
+	TweenService:Create(
+		p,
+		TweenInfo.new(2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ Size = Vector3.new(2048, 2048, 2048), Transparency = 1 }
+	):Play()
+
+	Debris:AddItem(p, 2.5)
+end
+
+local function setVillagerRarityAttributes(model, items)
+	local topTier = "common"
+	for _, item in ipairs(items) do
+		if RARITY_ORDER[item.Rarity] > RARITY_ORDER[topTier] then
+			topTier = item.Rarity
+		end
+	end
+
+	model:SetAttribute("TopRarity", topTier)
+	model:SetAttribute("TopRarityColorR", RARITY_COLORS[topTier].R)
+	model:SetAttribute("TopRarityColorG", RARITY_COLORS[topTier].G)
+	model:SetAttribute("TopRarityColorB", RARITY_COLORS[topTier].B)
+end
+
+local function getWeaponMode(toolName)
+	local n = string.lower(toolName)
+	if string.find(n, "shotgun", 1, true) then
+		return "shotgun"
+	elseif string.find(n, "rocketlauncher", 1, true) or string.find(n, "rocket_launcher", 1, true) or string.find(n, "rocket launcher", 1, true) then
+		return "rocketlauncher"
+	elseif string.find(n, "classicsword", 1, true) or string.find(n, "classic_sword", 1, true) or string.find(n, "classic sword", 1, true) then
+		return "classicsword"
+	elseif string.find(n, "machete", 1, true) then
+		return "machete"
+	end
+	return "generic"
+end
+
+local function getPlayerEquippedToolMode(player)
+	local character = player and player.Character
+	if not character then
+		return nil, nil
+	end
+
+	for _, child in ipairs(character:GetChildren()) do
+		if child:IsA("Tool") then
+			return getWeaponMode(child.Name), child
+		end
+	end
+
+	return nil, nil
+end
+
+local function getPlayerFromCreatorValue(value)
+	if not value then
+		return nil
+	end
+	if value:IsA("Player") then
+		return value
+	end
+	if value:IsA("Model") then
+		return Players:GetPlayerFromCharacter(value)
+	end
+	return nil
+end
+
+local function applyReputationDelta(player, delta)
+	if not player or not delta or delta == 0 then
+		return
+	end
+
+	local methods = {
+		"AddReputation",
+		"AdjustReputation",
+		"ModifyReputation",
+		"ChangeReputation",
+		"AddRep",
+		"AdjustRep",
+		"ModifyRep",
+		"ChangeRep",
+		"Add",
+		"Adjust",
+		"Modify",
+	}
+
+	for _, methodName in ipairs(methods) do
+		local fn = ReputationService[methodName]
+		if type(fn) == "function" then
+			local ok = pcall(fn, player, delta)
+			if not ok then
+				ok = pcall(fn, ReputationService, player, delta)
+			end
+			if ok then
+				return
+			end
+		end
+	end
+
+	local current = 0
+	pcall(function()
+		current = ReputationService.Get(player) or 0
+	end)
+
+	local attr = player:GetAttribute("Reputation")
+	if type(attr) ~= "number" then
+		attr = current
+	end
+	player:SetAttribute("Reputation", attr + delta)
+end
+
+local function getChaosModifiers()
+	local mods = {}
+	pcall(function()
+		mods = ReputationService.GetWorldModifiers() or {}
+	end)
+	return mods
+end
+
+local function isChaosActive()
+	local mods = getChaosModifiers()
+	return mods.Chaos == true or mods.CivilChaos == true or mods.CivilChaosActive == true
+end
+
+local function resolvePlayerFromValue(value)
+	if not value then
+		return nil
+	end
+
+	if typeof(value) == "Instance" and value:IsA("Player") then
+		return value
+	end
+
+	if type(value) == "number" then
+		return Players:GetPlayerByUserId(value)
+	end
+
+	if type(value) == "string" then
+		local userId = tonumber(value)
+		if userId then
+			return Players:GetPlayerByUserId(userId)
+		end
+		for _, player in ipairs(Players:GetPlayers()) do
+			if player.Name == value then
+				return player
+			end
+		end
+	end
+
+	return nil
+end
+
+local function getPriorityRepTarget()
+	local worstPlayer = nil
+	local worstRep = 0
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		local rep = ReputationService.Get(player) or 0
+		if rep < 0 and rep < worstRep then
+			worstRep = rep
+			worstPlayer = player
+		end
+	end
+
+	return worstPlayer, worstRep
+end
+
+local function getCivilChaosTargetPlayer()
+	if not isChaosActive() then
+		return nil
+	end
+
+	local mods = getChaosModifiers()
+	local keys = {
+		"ChaosOwner", "ChaosPlayer", "ChaosTarget", "ChaosResponsible", "ChaosResponsiblePlayer",
+		"CivilChaosPlayer", "CivilChaosOwner", "ChaosOwnerUserId", "ChaosPlayerUserId",
+		"ChaosTargetUserId", "ChaosResponsibleUserId", "CivilChaosUserId", "CivilChaosOwnerUserId",
+		"ResponsibleUserId",
+	}
+
+	for _, key in ipairs(keys) do
+		local player = resolvePlayerFromValue(mods[key])
+		if player then
+			return player
+		end
+	end
+
+	local fallback = select(1, getPriorityRepTarget())
+	return fallback
+end
+
+local function setCombatHumanoidStats(humanoid)
+	humanoid.WalkSpeed = 27
+	pcall(function()
+		humanoid.UseJumpPower = true
+	end)
+	pcall(function()
+		humanoid.JumpPower = 50
+	end)
+end
+
+local function getRandomVillagerWeapon()
+	local pool = {}
+	for _, inst in ipairs(villagerWeaponsFolder:GetChildren()) do
+		if inst:IsA("Tool") then
+			table.insert(pool, inst)
+		end
+	end
+	if #pool == 0 then
+		return nil
+	end
+	return pool[math.random(1, #pool)]
+end
+
+local function refreshZombieCache()
+	local now = os.clock()
+	if now - ZombieCache.LastRefresh < ZOMBIE_CACHE_REFRESH then
+		return ZombieCache.Models
+	end
+
+	table.clear(ZombieCache.Models)
+	for _, inst in ipairs(workspace:GetDescendants()) do
+		if inst:IsA("Model") and inst.Name == "Zombie" then
+			local humanoid = inst:FindFirstChildOfClass("Humanoid")
+			local hrp = inst:FindFirstChild("HumanoidRootPart")
+			if humanoid and hrp and humanoid.Health > 0 then
+				table.insert(ZombieCache.Models, inst)
+			end
+		end
+	end
+
+	ZombieCache.LastRefresh = now
+	return ZombieCache.Models
+end
+
+local function getNearestZombie(position, radius)
+	local zombies = refreshZombieCache()
+	local bestZombie = nil
+	local bestDistance = radius
+
+	for _, zombie in ipairs(zombies) do
+		local hrp = zombie:FindFirstChild("HumanoidRootPart")
+		local humanoid = zombie:FindFirstChildOfClass("Humanoid")
+		if hrp and humanoid and humanoid.Health > 0 then
+			local dist = (hrp.Position - position).Magnitude
+			if dist <= bestDistance then
+				bestDistance = dist
+				bestZombie = zombie
+			end
+		end
+	end
+
+	return bestZombie, bestDistance
+end
+
+local function refreshNearbyVillagersCache()
+	local now = os.clock()
+	if now - NearbyVillagerCache.LastRefresh < VILLAGER_NEAR_CACHE_REFRESH then
+		return NearbyVillagerCache.List
+	end
+
+	table.clear(NearbyVillagerCache.List)
+	for villagerId, data in pairs(Villagers) do
+		if data.Alive and data.Model and data.Model.Parent then
+			local hrp = getModelRootPart(data.Model)
+			if hrp then
+				table.insert(NearbyVillagerCache.List, {
+					Id = villagerId,
+					Root = hrp,
+					Model = data.Model,
+				})
+			end
+		end
+	end
+
+	NearbyVillagerCache.LastRefresh = now
+	return NearbyVillagerCache.List
+end
+
+local function findClosestVillagerToPosition(position, maxDistance)
+	local villagers = refreshNearbyVillagerCache()
+	local bestId = nil
+	local bestDist = maxDistance
+
+	for _, entry in ipairs(villagers) do
+		local d = (entry.Root.Position - position).Magnitude
+		if d <= bestDist then
+			bestDist = d
+			bestId = entry.Id
+		end
+	end
+
+	return bestId, bestDist
+end
+
+local function markPlayerThreat(player, toolName, mode, villagerId, villagerPosition)
+	local character = player.Character
+	local hrp = getCharacterRoot(character)
+	if not hrp then
+		return
+	end
+
+	RecentPlayerThreats[player.UserId] = {
+		Time = os.clock(),
+		WeaponMode = mode,
+		ToolName = toolName,
+		VillagerId = villagerId,
+		VillagerPosition = villagerPosition,
+		PlayerPosition = hrp.Position,
+	}
+end
+
+local function clearPlayerThreat(userId)
+	RecentPlayerThreats[userId] = nil
+end
+
+local function cleanupCombatTool(tool)
+	if tool and tool.Parent then
+		tool:Destroy()
+	end
+end
+
+local function ensureAnimator(humanoid)
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+	if not animator then
+		animator = Instance.new("Animator")
+		animator.Parent = humanoid
+	end
+	return animator
+end
+
+local function setVillagerWeaponGrip(tool)
+	local name = string.lower(tool.Name)
+	if string.find(name, "rocketlauncher", 1, true) or string.find(name, "rocket_launcher", 1, true) or string.find(name, "rocket launcher", 1, true) then
+		tool.Grip = CFrame.new(0, -0.15, -1.2) * CFrame.Angles(math.rad(-90), math.rad(90), 0)
+	elseif string.find(name, "shotgun", 1, true) then
+		tool.Grip = CFrame.new(0, -0.1, -1.1) * CFrame.Angles(math.rad(-90), math.rad(90), 0)
+	elseif string.find(name, "classicsword", 1, true) or string.find(name, "machete", 1, true) then
+		tool.Grip = CFrame.new(0, 0, -1.7, 0, 0, 1, 1, 0, 0, 0, 1, 0)
+	end
+end
+
+local function loadTrack(animator, id, looped, priority)
+	local anim = Instance.new("Animation")
+	anim.AnimationId = "rbxassetid://" .. tostring(id)
+	local track = animator:LoadAnimation(anim)
+	track.Looped = looped and true or false
+	if priority then
+		track.Priority = priority
+	end
+	return track
+end
+
+local function stopTrack(track, fadeTime)
+	if track and track.IsPlaying then
+		pcall(function()
+			track:Stop(fadeTime or 0.15)
+		end)
+	end
+end
+
+local function playTrack(track, fadeTime)
+	if track and not track.IsPlaying then
+		pcall(function()
+			track:Play(fadeTime or 0.15)
+		end)
+	end
+end
+
+local function setupVillagerAnimations(model, villagerId)
+	local data = Villagers[villagerId]
+	if not data or not model or not model.Parent then
+		return
+	end
+
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
+	end
+
+	local animator = ensureAnimator(humanoid)
+	local rigKey = (humanoid.RigType == Enum.HumanoidRigType.R6) and "R6" or "R15"
+	local ids = DEFAULT_ANIM_IDS[rigKey]
+
+	local state = {
+		idle1 = loadTrack(animator, ids.idle1, true, Enum.AnimationPriority.Idle),
+		idle2 = loadTrack(animator, ids.idle2, true, Enum.AnimationPriority.Idle),
+		walk = loadTrack(animator, ids.walk, true, Enum.AnimationPriority.Movement),
+		run = loadTrack(animator, ids.run, true, Enum.AnimationPriority.Movement),
+		jump = loadTrack(animator, ids.jump, false, Enum.AnimationPriority.Action),
+		fall = loadTrack(animator, ids.fall, true, Enum.AnimationPriority.Action),
+		climb = loadTrack(animator, ids.climb, true, Enum.AnimationPriority.Action),
+		swim = loadTrack(animator, ids.swim, true, Enum.AnimationPriority.Movement),
+		swimidle = loadTrack(animator, ids.swimidle, true, Enum.AnimationPriority.Idle),
+		toolhold = loadTrack(animator, ids.toolhold, true, Enum.AnimationPriority.Action),
+		connections = {},
+		currentMove = nil,
+		currentOverlay = nil,
+	}
+
+	data.AnimationState = state
+
+	local function setMove(name)
+		if state.currentMove == name then
+			return
+		end
+
+		state.currentMove = name
+		stopTrack(state.idle1, 0.15)
+		stopTrack(state.idle2, 0.15)
+		stopTrack(state.walk, 0.15)
+		stopTrack(state.run, 0.15)
+		stopTrack(state.swim, 0.15)
+		stopTrack(state.swimidle, 0.15)
+
+		if name == "idle" then
+			if math.random(1, 2) == 1 then
+				playTrack(state.idle1, 0.15)
+				stopTrack(state.idle2, 0.15)
+			else
+				playTrack(state.idle2, 0.15)
+				stopTrack(state.idle1, 0.15)
+			end
+		elseif name == "walk" then
+			playTrack(state.walk, 0.15)
+		elseif name == "run" then
+			playTrack(state.run, 0.15)
+		elseif name == "swim" then
+			playTrack(state.swim, 0.15)
+		elseif name == "swimidle" then
+			playTrack(state.swimidle, 0.15)
+		end
+	end
+
+	local function setOverlay(name)
+		if state.currentOverlay == name then
+			return
+		end
+
+		if state.currentOverlay == "jump" then
+			stopTrack(state.jump, 0.1)
+		elseif state.currentOverlay == "fall" then
+			stopTrack(state.fall, 0.1)
+		elseif state.currentOverlay == "climb" then
+			stopTrack(state.climb, 0.1)
+		end
+
+		state.currentOverlay = name
+
+		if name == "jump" then
+			playTrack(state.jump, 0.05)
+		elseif name == "fall" then
+			playTrack(state.fall, 0.1)
+		elseif name == "climb" then
+			playTrack(state.climb, 0.1)
+		end
+	end
+
+	table.insert(state.connections, humanoid.Running:Connect(function(speed)
+		if not data.Alive or not model.Parent then
+			return
+		end
+
+		local currentState = humanoid:GetState()
+		if currentState == Enum.HumanoidStateType.Swimming then
+			if speed > 1 then
+				setMove("swim")
+			else
+				setMove("swimidle")
+			end
+			return
+		end
+		if currentState == Enum.HumanoidStateType.Climbing then
+			setOverlay("climb")
+			return
+		end
+		if currentState == Enum.HumanoidStateType.Freefall then
+			setOverlay("fall")
+			return
+		end
+
+		if speed > 0.5 then
+			if speed > 12 then
+				setMove("run")
+			else
+				setMove("walk")
+			end
+		else
+			setMove("idle")
+		end
+	end))
+
+	table.insert(state.connections, humanoid.StateChanged:Connect(function(_, newState)
+		if not data.Alive or not model.Parent then
+			return
+		end
+
+		if newState == Enum.HumanoidStateType.Jumping then
+			setOverlay("jump")
+		elseif newState == Enum.HumanoidStateType.Freefall then
+			setOverlay("fall")
+		elseif newState == Enum.HumanoidStateType.Climbing then
+			setOverlay("climb")
+		elseif newState == Enum.HumanoidStateType.Swimming then
+			setMove("swimidle")
+		elseif newState == Enum.HumanoidStateType.Landed then
+			setOverlay(nil)
+		end
+	end))
+
+	table.insert(state.connections, humanoid.Jumping:Connect(function(active)
+		if active then
+			setOverlay("jump")
+		end
+	end))
+
+	setMove("idle")
+end
+
+local function playVillagerToolPose(villagerId, enabled)
+	local data = Villagers[villagerId]
+	if not data or not data.AnimationState then
+		return
+	end
+
+	local state = data.AnimationState
+	if enabled then
+		playTrack(state.toolhold, 0.12)
+	else
+		stopTrack(state.toolhold, 0.12)
+	end
+end
+
+local function clearVillagerCombatWeapon(villagerId)
+	local data = Villagers[villagerId]
+	if not data then
+		return
+	end
+	if data.CurrentCombatWeapon then
+		cleanupCombatTool(data.CurrentCombatWeapon)
+		data.CurrentCombatWeapon = nil
+	end
+end
+
+local function equipWeaponToVillager(model, villagerId)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return nil, nil
+	end
+
+	local template = getRandomVillagerWeapon()
+	if not template then
+		return nil, nil
+	end
+
+	local weapon = template:Clone()
+	weapon.CanBeDropped = false
+	weapon.Enabled = true
+	weapon.ManualActivationOnly = false
+	setVillagerWeaponGrip(weapon)
+	weapon.Parent = model
+
+	pcall(function()
+		humanoid:EquipTool(weapon)
+	end)
+
+	playVillagerToolPose(villagerId, true)
+	task.wait(WEAPON_EQUIP_DELAY)
+
+	return weapon, getWeaponMode(weapon.Name)
+end
+
+local function applyDeathSplashPhysics(model)
+	if not model or not model.Parent then
+		return
+	end
+
+	local root = getModelRootPart(model)
+	local center = root and root.Position or Vector3.new()
+
+	for _, inst in ipairs(model:GetDescendants()) do
+		if inst:IsA("BasePart") then
+			inst.CanCollide = true
+			inst.CanTouch = true
+			inst.CanQuery = true
+			inst.Massless = false
+
+			local offset = inst.Position - center
+			if offset.Magnitude < 0.05 then
+				offset = Vector3.new(math.random() - 0.5, 0.25, math.random() - 0.5)
+			end
+
+			local dir = offset.Unit
+			inst.AssemblyLinearVelocity = dir * THROW_SPLASH_VELOCITY + Vector3.new(0, 20, 0)
+			inst.AssemblyAngularVelocity = Vector3.new(
+				math.random(-10, 10),
+				math.random(-10, 10),
+				math.random(-10, 10)
+			)
+		end
+	end
+
+	pcall(function()
+		model:BreakJoints()
+	end)
+end
+
+local function destroyVillager(villagerId)
+	local data = Villagers[villagerId]
+	if not data then
+		return
+	end
+
+	data.Alive = false
+
+	if data.ThrowMonitorToken then
+		data.ThrowMonitorToken = nil
+	end
+
+	if data.AnimationState and data.AnimationState.connections then
+		for _, conn in ipairs(data.AnimationState.connections) do
+			if conn then
+				conn:Disconnect()
+			end
+		end
+	end
+
+	clearVillagerCombatWeapon(villagerId)
+	playVillagerToolPose(villagerId, false)
+
+	if data.CarriedBy then
+		local state = CarryStateByPlayer[data.CarriedBy]
+		if state and state.VillagerId == villagerId and state.Tool and state.Tool.Parent then
+			state.Tool:Destroy()
+		end
+		CarryStateByPlayer[data.CarriedBy] = nil
+	end
+
+	if data.Model and data.Model.Parent then
+		data.Model:Destroy()
+	end
+
+	Villagers[villagerId] = nil
+
+	for i = #VillagerOrder, 1, -1 do
+		if VillagerOrder[i] == villagerId then
+			table.remove(VillagerOrder, i)
+			if MovementCursor > #VillagerOrder then
+				MovementCursor = 1
+			end
+			break
+		end
+	end
+end
+
+local function resolveCombatTarget(targetModel)
+	local chaosPlayer = getCivilChaosTargetPlayer()
+	if chaosPlayer and chaosPlayer.Character then
+		return chaosPlayer.Character
+	end
+	return targetModel
+end
+
+startSupportBurst = function(centerPosition, targetModel)
+	for villagerId, data in pairs(Villagers) do
+		if data.Alive and data.Model and data.Model.Parent and not data.CarriedBy and not data.IsBaby then
+			local hrp = getModelRootPart(data.Model)
+			if hrp and (hrp.Position - centerPosition).Magnitude <= RETALIATE_RADIUS then
+				startAttackLoop(villagerId, targetModel, nil, false)
+			end
+		end
+	end
+end
+
+startAttackLoop = function(villagerId, targetModel, forcedMode, force)
+	targetModel = resolveCombatTarget(targetModel)
+
+	local data = Villagers[villagerId]
+	if not data or not data.Alive or not data.Model or not data.Model.Parent then
+		return
+	end
+
+	if data.IsBaby then
+		return
+	end
+
+	local targetPlayer = Players:GetPlayerFromCharacter(targetModel)
+	if targetPlayer then
+		local targetRep = ReputationService.Get(targetPlayer) or 0
+		if targetRep >= 0 and not isChaosActive() then
+			return
+		end
+
+		pcall(function()
+			ReputationService.MarkVillagerAggro(targetPlayer)
+		end)
+	end
+
+	if data.Busy and data.CurrentCombatTarget == targetModel then
+		return
+	end
+
+	if data.Busy and not force then
+		return
+	end
+
+	data.Busy = true
+	data.CombatToken = (data.CombatToken or 0) + 1
+	data.CurrentCombatTarget = targetModel
+
+	local combatToken = data.CombatToken
+
+	task.spawn(function()
+		local model = data.Model
+		local humanoid = model and model:FindFirstChildOfClass("Humanoid")
+		if not model or not humanoid then
+			if Villagers[villagerId] and Villagers[villagerId].CombatToken == combatToken then
+				Villagers[villagerId].Busy = false
+				Villagers[villagerId].CurrentCombatTarget = nil
+			end
+			return
+		end
+
+		clearVillagerCombatWeapon(villagerId)
+
+		local weapon, mode = equipWeaponToVillager(model, villagerId)
+		mode = forcedMode or mode or "generic"
+		if not weapon then
+			mode = forcedMode or "generic"
+		end
+
+		data.CurrentCombatWeapon = weapon
+		setCombatHumanoidStats(humanoid)
+
+		local attackStart = os.clock()
+		local lastFire = 0
+		local lastJump = 0
+		local lastMove = 0
+
+		while data.Alive and model.Parent and data.CombatToken == combatToken do
+			local targetHumanoid = targetModel and targetModel:FindFirstChildOfClass("Humanoid")
+			local targetHrp = targetModel and getModelRootPart(targetModel)
+
+			if not targetHumanoid or not targetHrp or targetHumanoid.Health <= 0 then
+				break
+			end
+
+			local hrp = getModelRootPart(model)
+			if not hrp then
+				break
+			end
+
+			local dist = (targetHrp.Position - hrp.Position).Magnitude
+
+			if mode == "shotgun" then
+				local away = (hrp.Position - targetHrp.Position)
+				if away.Magnitude < 0.1 then
+					away = Vector3.new(1, 0, 0)
+				end
+				if dist < 60 and os.clock() - lastMove > 0.35 then
+					humanoid:MoveTo(hrp.Position + away.Unit * 18)
+					lastMove = os.clock()
+				end
+				if os.clock() - lastJump > 0.6 then
+					humanoid.Jump = true
+					lastJump = os.clock()
+				end
+				if dist <= 120 and os.clock() - lastFire > 1.1 then
+					if weapon then
+						pcall(function()
+							weapon:Activate()
+						end)
+					end
+					lastFire = os.clock()
+				end
+
+			elseif mode == "rocketlauncher" then
+				local away = (hrp.Position - targetHrp.Position)
+				if away.Magnitude < 0.1 then
+					away = Vector3.new(1, 0, 0)
+				end
+
+				local safeDistance = 95
+				local retreatDistance = 130
+
+				if dist < retreatDistance and os.clock() - lastMove > 0.25 then
+					humanoid:MoveTo(hrp.Position + away.Unit * 28)
+					lastMove = os.clock()
+				end
+
+				if os.clock() - lastJump > 0.75 then
+					humanoid.Jump = true
+					lastJump = os.clock()
+				end
+
+				if dist >= safeDistance and os.clock() - lastFire > 1.3 then
+					if weapon then
+						pcall(function()
+							weapon:Activate()
+						end)
+					end
+					lastFire = os.clock()
+				end
+
+			elseif mode == "classicsword" or mode == "machete" then
+				if dist > 8 and os.clock() - lastMove > 0.25 then
+					humanoid:MoveTo(targetHrp.Position)
+					lastMove = os.clock()
+				end
+				if os.clock() - lastFire > 0.3 then
+					if weapon then
+						pcall(function()
+							weapon:Activate()
+						end)
+					end
+					lastFire = os.clock()
+				end
+
+			else
+				if dist > 10 and os.clock() - lastMove > 0.35 then
+					humanoid:MoveTo(targetHrp.Position)
+					lastMove = os.clock()
+				end
+				if os.clock() - lastFire > 0.65 then
+					if weapon then
+						pcall(function()
+							weapon:Activate()
+						end)
+					end
+					lastFire = os.clock()
+				end
+			end
+
+			task.wait(0.25)
+			if os.clock() - attackStart > COMBAT_MAX_DURATION then
+				break
+			end
+		end
+
+		playVillagerToolPose(villagerId, false)
+
+		if weapon then
+			cleanupCombatTool(weapon)
+		end
+
+		if Villagers[villagerId] and Villagers[villagerId].CombatToken == combatToken then
+			Villagers[villagerId].Busy = false
+			Villagers[villagerId].CurrentCombatTarget = nil
+			Villagers[villagerId].CurrentCombatWeapon = nil
+		end
+	end)
+end
+
+local function chooseRetaliationPlayer(deathPosition, villagerId)
+	local chaosPlayer = getCivilChaosTargetPlayer()
+	if chaosPlayer then
+		return chaosPlayer, 100
+	end
+
+	local bestPlayer = nil
+	local bestScore = 0
+
+	for userId, threat in pairs(RecentPlayerThreats) do
+		if os.clock() - threat.Time <= THREAT_WINDOW then
+			local player = Players:GetPlayerByUserId(userId)
+			if player and player.Character then
+				local charHrp = getCharacterRoot(player.Character)
+				if charHrp then
+					local score = 0
+					if threat.VillagerId == villagerId then
+						score += 6
+					end
+					if threat.VillagerPosition and (threat.VillagerPosition - deathPosition).Magnitude <= 40 then
+						score += 4
+					end
+					if (charHrp.Position - deathPosition).Magnitude <= 120 then
+						score += 2
+					end
+					if score > bestScore then
+						bestScore = score
+						bestPlayer = player
+					end
+				end
+			end
+		end
+	end
+
+	return bestPlayer, bestScore
+end
+
+onVillagerKilled = function(villagerId)
+	local data = Villagers[villagerId]
+	if not data or not data.Model then
+		return
+	end
+
+	local rootPart = getModelRootPart(data.Model)
+	local deathPosition = rootPart and rootPart.Position or Vector3.new()
+	local player, score = chooseRetaliationPlayer(deathPosition, villagerId)
+
+	if player and not data.SuppressKillRegistration then
+		pcall(function()
+			ReputationService.RegisterVillagerKill(player)
+		end)
+	end
+
+	if player and score > 0 and player.Character then
+		startSupportBurst(deathPosition, player.Character)
+	end
+end
+
+local function queueDeathCleanup(villagerId)
+	local data = Villagers[villagerId]
+	if not data or data.DeathQueued then
+		return
+	end
+
+	data.DeathQueued = true
+	task.delay(DEATH_DESPAWN_DELAY, function()
+		local current = Villagers[villagerId]
+		if not current or not current.Model then
+			return
+		end
+
+		local humanoid = current.Model:FindFirstChildOfClass("Humanoid")
+		if humanoid and humanoid.Health > 0 then
+			current.DeathQueued = false
+			return
+		end
+
+		applyDeathSplashPhysics(current.Model)
+		onVillagerKilled(villagerId)
+		destroyVillager(villagerId)
+	end)
+end
+
+local function createVillagerName(villagerType)
+	if villagerType == "baby" then
+		return "Baby Villager " .. BABY_NAMES[math.random(1, #BABY_NAMES)]
+	elseif villagerType == "child" then
+		return "Child Villager " .. MALE_NAMES[math.random(1, #MALE_NAMES)]
+	else
+		local namePool = (math.random(1, 2) == 1) and FEMALE_NAMES or MALE_NAMES
+		return "Villager " .. namePool[math.random(1, #namePool)]
+	end
+end
+
+local function pickVillagerType()
+	local roll = math.random()
+	if roll < BABY_SPAWN_CHANCE then
+		return "baby"
+	elseif roll < BABY_SPAWN_CHANCE + CHILD_SPAWN_CHANCE then
+		return "child"
+	else
+		return "adult"
+	end
+end
+
+local function applyVillagerScale(model, villagerType)
+	local scale = 1
+	if villagerType == "child" then
+		scale = CHILD_SCALE
+	elseif villagerType == "baby" then
+		scale = BABY_SCALE
+	end
+	pcall(function()
+		model:ScaleTo(scale)
+	end)
+end
+
+local function configureVillagerHumanoid(model, villagerType)
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.BreakJointsOnDeath = true
+		hum.RequiresNeck = false
+		if villagerType == "child" then
+			hum.WalkSpeed = 13
+			hum.MaxHealth = 90
+		elseif villagerType == "baby" then
+			hum.WalkSpeed = 10
+			hum.MaxHealth = 60
+		else
+			hum.WalkSpeed = 12
+			hum.MaxHealth = 100
+		end
+		hum.AutoRotate = true
+		hum.Health = hum.MaxHealth
+	end
+end
+
+local function monitorVillagerDeath(model, villagerId)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
+	end
+	humanoid.BreakJointsOnDeath = true
+	humanoid.Died:Connect(function()
+		applyDeathSplashPhysics(model)
+		queueDeathCleanup(villagerId)
+	end)
+end
+
+local function getCarryHumanoid(model)
+	return model and model:FindFirstChildOfClass("Humanoid")
+end
+
+local function makeCarryTool()
+	local tool = Instance.new("Tool")
+	tool.Name = "VillagerCarry"
+	tool.RequiresHandle = true
+	tool.CanBeDropped = false
+	tool.ManualActivationOnly = false
+	tool.ToolTip = "Click to throw toward your mouse"
+
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(1, 1, 1)
+	handle.Transparency = 1
+	handle.CanCollide = false
+	handle.CanTouch = false
+	handle.CanQuery = false
+	handle.Massless = true
+	handle.Anchored = false
+	handle.Parent = tool
+
+	return tool
+end
+
+local function setThrownPlatformStand(villagerId, enabled)
+	local data = Villagers[villagerId]
+	if not data or not data.Model then
+		return
+	end
+	local humanoid = data.Model:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
+	end
+	humanoid.PlatformStand = enabled and true or false
+	if enabled then
+		pcall(function()
+			humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+		end)
+	end
+end
+
+local function calculateImpactDamage(speed, isGround)
+	if isGround then
+		local extra = math.max(0, speed - 20)
+		local damage = THROW_GROUND_BASE_DAMAGE + math.floor(extra * THROW_GROUND_DAMAGE_SCALE)
+		return math.clamp(damage, THROW_GROUND_BASE_DAMAGE, 1000)
+	end
+
+	local extra = math.max(0, speed - THROW_WALL_KILL_MIN_SPEED)
+	local damage = 100 + math.floor(extra * 4)
+	return math.clamp(damage, 100, 1000)
+end
+
+local function applyThrownGroundDamage(villagerId, player, humanoid, speed, impactPosition)
+	local data = Villagers[villagerId]
+	if not data or not data.Alive or not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	local damage = calculateImpactDamage(speed, true)
+	humanoid:TakeDamage(damage)
+
+	if humanoid.Health <= 0 then
+		killVillagerWithImpact(villagerId, player, impactPosition, false, speed)
+	end
+end
+
+function killVillagerWithImpact(villagerId, player, impactPosition, directWallImpact, speed)
+	local data = Villagers[villagerId]
+	if not data or not data.Alive or not data.Model or not data.Model.Parent then
+		return
+	end
+
+	if data.ImpactKilled then
+		return
+	end
+	data.ImpactKilled = true
+	data.SuppressKillRegistration = true
+
+	if player then
+		applyReputationDelta(player, -150)
+		markPlayerThreat(player, "VillagerCarry", directWallImpact and "wall" or "ground", villagerId, impactPosition)
+	end
+
+	local humanoid = data.Model:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		humanoid.BreakJointsOnDeath = true
+		humanoid.Health = 0
+	end
+
+	applyDeathSplashPhysics(data.Model)
+	queueDeathCleanup(villagerId)
+end
+
+local function releaseCarriedVillager(player, throwIt)
+	local state = CarryStateByPlayer[player.UserId]
+	if not state then
+		return
+	end
+
+	CarryStateByPlayer[player.UserId] = nil
+
+	local villagerId = state.VillagerId
+	local data = Villagers[villagerId]
+	if data then
+		data.CarriedBy = nil
+		data.Busy = false
+	end
+
+	local model = state.Model
+	if model and model.Parent then
+		local root = getModelRootPart(model)
+		local char = player.Character
+		local chrp = getCharacterRoot(char)
+
+		if root and chrp then
+			root.CFrame = chrp.CFrame * CARRY_FRONT_OFFSET
+		end
+
+		for _, inst in ipairs(model:GetDescendants()) do
+			if inst:IsA("BasePart") then
+				inst.CanCollide = true
+				inst.CanTouch = true
+				inst.CanQuery = true
+				inst.Massless = false
+			end
+		end
+
+		local weld = model:FindFirstChild("CarryWeld", true)
+		if weld then
+			weld:Destroy()
+		end
+
+		if throwIt and root and chrp then
+			local aimPos = state.AimPosition
+			local throwDir
+
+			if typeof(aimPos) == "Vector3" then
+				throwDir = aimPos - chrp.Position
+			end
+
+			if not throwDir or throwDir.Magnitude < 0.1 then
+				throwDir = chrp.CFrame.LookVector
+			end
+
+			if throwDir.Magnitude < 0.1 then
+				throwDir = Vector3.new(0, 0, -1)
+			end
+
+			if data and data.Model then
+				setThrownPlatformStand(villagerId, true)
+				setVillagerThrowHighlight(villagerId, true)
+
+				data.ThrowHighlightToken = (data.ThrowHighlightToken or 0) + 1
+				local highlightToken = data.ThrowHighlightToken
+				task.delay(THROW_HIGHLIGHT_DURATION, function()
+					local current = Villagers[villagerId]
+					if current and current.ThrowHighlightToken == highlightToken then
+						setVillagerThrowHighlight(villagerId, false)
+					end
+				end)
+			end
+
+			root.AssemblyLinearVelocity = throwDir.Unit * THROW_VELOCITY
+			root.AssemblyAngularVelocity = Vector3.new(
+				math.random(-10, 10),
+				math.random(-10, 10),
+				math.random(-10, 10)
+			)
+
+			markPlayerThreat(player, "VillagerCarry", "throw", villagerId, root.Position)
+			applyReputationDelta(player, -150)
+
+			if data then
+				data.ThrowMonitorToken = (data.ThrowMonitorToken or 0) + 1
+				local token = data.ThrowMonitorToken
+
+				task.spawn(function()
+					local humanoid = model:FindFirstChildOfClass("Humanoid")
+					local startTime = os.clock()
+					local lastPos = root.Position
+					local touchDebounce = false
+
+					local touchedConn
+					touchedConn = root.Touched:Connect(function(hit)
+						if touchDebounce then
+							return
+						end
+						if not data.Alive or data.ThrowMonitorToken ~= token then
+							return
+						end
+						if not hit or not hit.Parent then
+							return
+						end
+						if player.Character and hit:IsDescendantOf(player.Character) then
+							return
+						end
+
+						local elapsed = os.clock() - startTime
+						if elapsed < THROW_GRACE_TIME then
+							return
+						end
+
+						local speed = root.AssemblyLinearVelocity.Magnitude
+						if speed < 8 then
+							return
+						end
+
+						local isGround = hit == workspace.Terrain
+							or (hit:IsA("BasePart") and math.abs(hit.CFrame.UpVector.Y) > 0.55)
+
+						if not isGround and speed >= THROW_WALL_KILL_MIN_SPEED then
+							touchDebounce = true
+							killVillagerWithImpact(villagerId, player, root.Position, false, speed)
+						elseif isGround then
+							touchDebounce = true
+							applyThrownGroundDamage(villagerId, player, humanoid, speed, root.Position)
+						end
+					end)
+
+					while data.Alive and data.Model == model and model.Parent and data.ThrowMonitorToken == token do
+						if os.clock() - startTime >= THROW_PLATFORMSTAND_TIME then
+							break
+						end
+
+						local currentPos = root.Position
+						local delta = currentPos - lastPos
+						local speed = root.AssemblyLinearVelocity.Magnitude
+
+						if (os.clock() - startTime) >= THROW_GRACE_TIME and delta.Magnitude > 0.05 then
+							local params = RaycastParams.new()
+							params.FilterType = Enum.RaycastFilterType.Exclude
+							params.FilterDescendantsInstances = { model }
+							params.IgnoreWater = false
+
+							local result = workspace:Raycast(lastPos, delta, params)
+							if result then
+								local hit = result.Instance
+								local isGround = result.Normal.Y >= 0.55
+								if isGround then
+									applyThrownGroundDamage(villagerId, player, humanoid, speed, result.Position)
+								else
+									killVillagerWithImpact(villagerId, player, result.Position, true, speed)
+								end
+								break
+							end
+						end
+
+						lastPos = currentPos
+						RunService.Heartbeat:Wait()
+					end
+
+					if touchedConn then
+						touchedConn:Disconnect()
+					end
+
+					if data and data.Alive and data.Model == model and data.ThrowMonitorToken == token then
+						setThrownPlatformStand(villagerId, false)
+						setVillagerThrowHighlight(villagerId, false)
+					end
+				end)
+			end
+		end
+	end
+
+	if state.Tool and state.Tool.Parent then
+		state.Tool:Destroy()
+	end
+end
+
+local function attachCarryVillager(player, villagerId)
+	if CarryStateByPlayer[player.UserId] then
+		return false
+	end
+
+	local data = Villagers[villagerId]
+	if not data or not data.Model or not data.Model.Parent then
+		return false
+	end
+
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local hrp = getCharacterRoot(character)
+	local root = getModelRootPart(data.Model)
+
+	if not humanoid or not hrp or not root then
+		return false
+	end
+
+	local backpack = player:FindFirstChildOfClass("Backpack")
+	if not backpack then
+		backpack = player:WaitForChild("Backpack")
+	end
+
+	if backpack:FindFirstChild("VillagerCarry") or (character and character:FindFirstChild("VillagerCarry")) then
+		return false
+	end
+
+	local tool = makeCarryTool()
+	tool.Parent = backpack
+
+	local equippedConn
+	equippedConn = tool.Equipped:Connect(function()
+		local currentData = Villagers[villagerId]
+		if not currentData or currentData.CarriedBy or currentData.DeathQueued then
+			return
+		end
+
+		local char = player.Character
+		local chrp = getCharacterRoot(char)
+		local model = currentData.Model
+		local modelRoot = getModelRootPart(model)
+		if not char or not chrp or not modelRoot then
+			return
+		end
+
+		currentData.CarriedBy = player.UserId
+		currentData.Busy = true
+
+		for _, inst in ipairs(model:GetDescendants()) do
+			if inst:IsA("BasePart") then
+				inst.CanCollide = false
+				inst.CanTouch = false
+				inst.CanQuery = false
+				inst.Massless = true
+			end
+		end
+
+		modelRoot.CFrame = chrp.CFrame * CARRY_FRONT_OFFSET
+
+		local weld = Instance.new("WeldConstraint")
+		weld.Name = "CarryWeld"
+		weld.Part0 = modelRoot
+		weld.Part1 = chrp
+		weld.Parent = modelRoot
+
+		CarryStateByPlayer[player.UserId] = {
+			Tool = tool,
+			Model = model,
+			VillagerId = villagerId,
+			Weld = weld,
+			AimPosition = nil,
+		}
+	end)
+
+	tool.AncestryChanged:Connect(function(_, parent)
+		if not parent then
+			if CarryStateByPlayer[player.UserId] and CarryStateByPlayer[player.UserId].VillagerId == villagerId then
+				releaseCarriedVillager(player, false)
+			end
+			if equippedConn then
+				equippedConn:Disconnect()
+			end
+		end
+	end)
+
+	humanoid:EquipTool(tool)
+	return true
+end
+
+local function monitorVillagerLifetime(villagerId)
+	task.spawn(function()
+		while true do
+			local data = Villagers[villagerId]
+			if not data or not data.Alive or not data.Model or not data.Model.Parent then
+				return
+			end
+
+			if data.DespawnAt and os.clock() >= data.DespawnAt then
+				if data.Busy then
+					data.DespawnAt = os.clock() + 30
+				else
+					destroyVillager(villagerId)
+					return
+				end
+			end
+
+			task.wait(3)
+		end
+	end)
+end
+
+local function watchVillagerHealth(model, villagerId)
+	task.spawn(function()
+		local humanoid = model:FindFirstChildOfClass("Humanoid")
+		if not humanoid then
+			return
+		end
+
+		local data = Villagers[villagerId]
+		if not data then
+			return
+		end
+
+		data.LastHealth = humanoid.Health
+
+		while model.Parent and Villagers[villagerId] and Villagers[villagerId].Alive do
+			local currentHealth = humanoid.Health
+			local previousHealth = data.LastHealth or currentHealth
+
+			if currentHealth < previousHealth then
+				local creatorTag = humanoid:FindFirstChild("creator")
+				local creatorValue = creatorTag and creatorTag.Value
+				local player = getPlayerFromCreatorValue(creatorValue)
+
+				if player and player.Character then
+					local equippedMode, equippedTool = getPlayerEquippedToolMode(player)
+					if equippedMode == "classicsword" then
+						local playerRoot = getCharacterRoot(player.Character)
+						if playerRoot then
+							local targetId = select(1, findClosestVillagerToPosition(playerRoot.Position, 8))
+							if targetId then
+								local targetData = Villagers[targetId]
+								if targetData and targetData.Alive and targetData.Model and targetData.Model.Parent then
+									local targetRoot = getModelRootPart(targetData.Model)
+									markPlayerThreat(player, equippedTool and equippedTool.Name or "ClassicSword", equippedMode, targetId, targetRoot and targetRoot.Position or nil)
+									startAttackLoop(targetId, player.Character, equippedMode, false)
+								end
+							end
+						end
+					end
+				end
+			end
+
+			data.LastHealth = currentHealth
+
+			if humanoid.Health <= 0 then
+				queueDeathCleanup(villagerId)
+				break
+			end
+
+			task.wait(HEALTH_POLL_INTERVAL)
+		end
+	end)
+end
+
+local function supportOrIgnoreOnMonsterFight(player, toolName, mode)
+	if isChaosActive() then
+		return false
+	end
+
+	local character = player.Character
+	local hrp = getCharacterRoot(character)
+	if not hrp then
+		return false
+	end
+
+	local nearbyZombie = getNearestZombie(hrp.Position, MONSTER_ASSIST_RADIUS)
+	if nearbyZombie then
+		local zombieRoot = getModelRootPart(nearbyZombie)
+		if zombieRoot then
+			startSupportBurst(zombieRoot.Position, nearbyZombie)
+			return true
+		end
+	end
+
+	return false
+end
+
+local function getActiveVillagerCount()
+	local count = 0
+	for _, data in pairs(Villagers) do
+		if data.Alive and data.Model and data.Model.Parent then
+			count += 1
+		end
+	end
+	return count
+end
+
+local function spawnVillager()
+	local templates = getTemplateList()
+	if #templates == 0 then
+		warn("[VillagerTrade] No models found inside ServerStorage.VillagerTemplates")
+		return
+	end
+
+	local roads = getRoadParts()
+	if #roads == 0 then
+		warn("[VillagerTrade] No parts named 'SnowWorldMudRoad' found in Workspace yet.")
+		return
+	end
+
+	local template = templates[math.random(1, #templates)]
+	local model = template:Clone()
+	model.Parent = villagerFolder
+
+	ensurePrimaryPart(model)
+	if not model.PrimaryPart then
+		warn("[VillagerTrade] Template missing HumanoidRootPart / PrimaryPart: " .. model.Name)
+		model:Destroy()
+		return
+	end
+
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		warn("[VillagerTrade] Villager template missing Humanoid: " .. model.Name)
+		model:Destroy()
+		return
+	end
+
+	local villagerId = HttpService:GenerateGUID(false)
+	local villagerType = pickVillagerType()
+
+	model:SetAttribute("VillagerId", villagerId)
+	model:SetAttribute("Tradeable", villagerType == "adult")
+	model:SetAttribute("IsChild", villagerType == "child")
+	model:SetAttribute("IsBaby", villagerType == "baby")
+	model:SetAttribute("VillagerType", villagerType)
+	model.Name = createVillagerName(villagerType)
+
+	applyVillagerScale(model, villagerType)
+	configureVillagerHumanoid(model, villagerType)
+
+	local items = {}
+	local itemMap = {}
+
+	if villagerType == "adult" then
+		items = buildVillagerItemList()
+		setVillagerRarityAttributes(model, items)
+
+		for _, item in ipairs(items) do
+			local templateTool = tradablesFolder:FindFirstChild(item.ToolName)
+			if templateTool and templateTool:IsA("Tool") then
+				itemMap[item.Id] = templateTool
+			end
+		end
+	else
+		setVillagerRarityAttributes(model, {})
+	end
+
+	local despawnTime = os.clock() + math.random(MIN_LIFETIME, MAX_LIFETIME)
+
+	Villagers[villagerId] = {
+		Model = model,
+		Items = items,
+		ToolMap = itemMap,
+		Alive = true,
+		Busy = false,
+		CombatToken = 0,
+		DeathQueued = false,
+		CurrentCombatTarget = nil,
+		CurrentCombatWeapon = nil,
+		AnimationState = nil,
+		LastHealth = humanoid.Health,
+		DespawnAt = despawnTime,
+		CurrentRoad = nil,
+		NextMoveAt = os.clock() + math.random(2, 4),
+		IsChild = villagerType == "child",
+		IsBaby = villagerType == "baby",
+		CarriedBy = nil,
+		SuppressKillRegistration = false,
+		ImpactKilled = false,
+		ThrowMonitorToken = 0,
+		ThrowHighlightToken = 0,
+		ThrowHighlight = nil,
+	}
+
+	table.insert(VillagerOrder, villagerId)
+
+	setupVillagerAnimations(model, villagerId)
+	watchVillagerHealth(model, villagerId)
+	monitorVillagerLifetime(villagerId)
+	monitorVillagerDeath(model, villagerId)
+
+	local road = randomRoadPart()
+	if road then
+		Villagers[villagerId].CurrentRoad = road
+		placeOnRoad(model, road)
+	end
+
+	local promptTrade
+	local promptPickup
+
+	if villagerType == "baby" then
+		promptPickup = createPrompt(model, "Pick Up", "Baby Villager", Vector2.new(0, 0))
+	elseif villagerType == "child" then
+		promptPickup = createPrompt(model, "Pick Up", "Child Villager", Vector2.new(0, 0))
+	else
+		promptTrade = createPrompt(model, "Trade", "Villager", Vector2.new(0, 0))
+	end
+
+	addHighlight(model, villagerType == "baby" and Color3.fromRGB(180, 220, 255) or RARITY_COLORS[model:GetAttribute("TopRarity") or "common"])
+
+	if villagerType == "adult" then
+		if promptTrade then
+			promptTrade.Triggered:Connect(function(player)
+				local data = Villagers[villagerId]
+				if not data or not data.Model or not data.Model.Parent then
+					return
+				end
+				tradeRemote:FireClient(player, "Open", {
+					VillagerId = villagerId,
+					VillagerName = model.Name,
+					Items = items,
+				})
+			end)
+		end
+	else
+		if promptPickup then
+			promptPickup.Triggered:Connect(function(player)
+				local data = Villagers[villagerId]
+				if not data or not data.Model or not data.Model.Parent then
+					return
+				end
+				attachCarryVillager(player, villagerId)
+			end)
+		end
+	end
+
+	local topRarity = model:GetAttribute("TopRarity") or "common"
+	local pos = model.PrimaryPart.Position
+
+	if villagerType == "adult" then
+		if topRarity == "legendary" then
+			announceToAll("Notify", {
+				Message = "A legendary trade has appeared in SnowWorld!",
+				Color = RARITY_COLORS.legendary,
+			})
+		elseif topRarity == "mythical" then
+			announceToAll("Notify", {
+				Message = "A mythical trade has appeared in SnowWorld!",
+				Color = RARITY_COLORS.mythical,
+			})
+		elseif topRarity == "divine" then
+			announceToAll("Divine", {
+				Message = "A rare trade awaits the most promising players...",
+				Color = RARITY_COLORS.divine,
+				Position = pos,
+			})
+			makeDivineShockwave(pos)
+		end
+	end
+
+	print(string.format("[VillagerTrade] Spawned %s with %d item(s) on %s", model.Name, #items, road and road:GetFullName() or "road not found"))
+end
+
+local function getSpawnSettings()
+	local mods = {}
+	pcall(function()
+		mods = ReputationService.GetWorldModifiers() or {}
+	end)
+
+	local spawnMultiplier = tonumber(mods.SpawnMultiplier) or 1
+	local capMultiplier = tonumber(mods.CapMultiplier) or 1
+
+	local interval = BASE_SPAWN_INTERVAL / math.max(1, spawnMultiplier)
+	local cap = math.floor(BASE_MAX_ACTIVE_VILLAGERS * math.max(1, capMultiplier))
+
+	return math.max(0.25, interval), math.max(1, cap), mods
+end
+
+local function moveVillagersLightly()
+	task.spawn(function()
+		while true do
+			if #VillagerOrder > 0 then
+				local processed = 0
+				local count = #VillagerOrder
+				local chaosPlayer = getCivilChaosTargetPlayer()
+
+				while processed < math.min(MOVE_BATCH_PER_TICK, count) and #VillagerOrder > 0 do
+					if MovementCursor > #VillagerOrder then
+						MovementCursor = 1
+					end
+
+					local villagerId = VillagerOrder[MovementCursor]
+					MovementCursor += 1
+					processed += 1
+
+					local data = villagerId and Villagers[villagerId]
+					if data and data.Alive and data.Model and data.Model.Parent and not data.Busy and not data.DeathQueued and not data.CarriedBy then
+						local now = os.clock()
+						if not data.NextMoveAt or now >= data.NextMoveAt then
+							local model = data.Model
+							local humanoid = model:FindFirstChildOfClass("Humanoid")
+							local hrp = getModelRootPart(model)
+
+							if humanoid and hrp then
+								if chaosPlayer and chaosPlayer.Character then
+									startAttackLoop(villagerId, chaosPlayer.Character, nil, true)
+								else
+									if not data.IsBaby then
+										local priorityPlayer, priorityRep = getPriorityRepTarget()
+										if priorityPlayer and priorityPlayer.Character and priorityRep <= -1000 then
+											local targetRoot = getCharacterRoot(priorityPlayer.Character)
+											if targetRoot and (targetRoot.Position - hrp.Position).Magnitude <= 400 then
+												startAttackLoop(villagerId, priorityPlayer.Character, nil, true)
+											end
+										end
+
+										local zombie = getNearestZombie(hrp.Position, ZOMBIE_DETECTION_RADIUS)
+										if zombie then
+											startAttackLoop(villagerId, zombie, nil, false)
+										end
+									end
+								end
+
+								local currentRoad = data.CurrentRoad
+								if not currentRoad or not currentRoad.Parent then
+									currentRoad = randomRoadPart()
+								end
+
+								local nextRoad = getDifferentRoadPart(currentRoad)
+								if nextRoad then
+									data.CurrentRoad = nextRoad
+									local destination = getRandomPointOnRoad(nextRoad)
+									if destination then
+										humanoid:MoveTo(destination)
+									end
+								end
+
+								local extraDelay = data.IsBaby and 1.5 or (data.IsChild and 0.75 or 0)
+								data.NextMoveAt = now + math.random(2, 4) + extraDelay
+							end
+						end
+					end
+
+					if MovementCursor > #VillagerOrder then
+						MovementCursor = 1
+					end
+				end
+			end
+
+			task.wait(MOVE_TICK_DELAY)
+		end
+	end)
+end
+
+local function hookPlayerTool(tool, player)
+	if ToolConnections[tool] then
+		return
+	end
+	if not tool:IsA("Tool") then
+		return
+	end
+
+	local mode = getWeaponMode(tool.Name)
+	if mode ~= "shotgun" and mode ~= "rocketlauncher" and mode ~= "classicsword" and mode ~= "machete" then
+		return
+	end
+
+	ToolConnections[tool] = true
+
+	tool.AncestryChanged:Connect(function(_, parent)
+		if not parent then
+			ToolConnections[tool] = nil
+		end
+	end)
+
+	tool.Activated:Connect(function()
+		if not player or not player.Parent then
+			return
+		end
+
+		local character = player.Character
+		local hrp = getCharacterRoot(character)
+		if not hrp then
+			return
+		end
+
+		if supportOrIgnoreOnMonsterFight(player, tool.Name, mode) then
+			return
+		end
+
+		local provokeRange
+		if mode == "shotgun" then
+			provokeRange = 20
+		elseif mode == "rocketlauncher" then
+			provokeRange = 50
+		elseif mode == "classicsword" or mode == "machete" then
+			provokeRange = 8
+		end
+
+		if not provokeRange then
+			return
+		end
+
+		local villagerId = select(1, findClosestVillagerToPosition(hrp.Position, provokeRange))
+		if villagerId then
+			local data = Villagers[villagerId]
+			if data and data.Alive and data.Model and data.Model.Parent and not data.IsBaby then
+				local rootPart = getModelRootPart(data.Model)
+				markPlayerThreat(player, tool.Name, mode, villagerId, rootPart and rootPart.Position or nil)
+				startAttackLoop(villagerId, character, mode, false)
+			end
+		end
+	end)
+end
+
+local function hookContainerForTools(player, container)
+	if not container then
+		return
+	end
+
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Tool") then
+			hookPlayerTool(child, player)
+		end
+	end
+
+	container.ChildAdded:Connect(function(child)
+		if child:IsA("Tool") then
+			hookPlayerTool(child, player)
+		end
+	end)
+end
+
+local function setupPlayer(player)
+	clearPlayerThreat(player.UserId)
+
+	local backpack = player:WaitForChild("Backpack")
+	hookContainerForTools(player, backpack)
+
+	player.CharacterAdded:Connect(function(character)
+		clearPlayerThreat(player.UserId)
+
+		local hum = character:WaitForChild("Humanoid", 10)
+		if hum then
+			hum.Died:Connect(function()
+				releaseCarriedVillager(player, false)
+			end)
+		end
+
+		hookContainerForTools(player, character)
+	end)
+
+	player.CharacterRemoving:Connect(function()
+		clearPlayerThreat(player.UserId)
+		releaseCarriedVillager(player, false)
+	end)
+
+	if player.Character then
+		hookContainerForTools(player, player.Character)
+	end
+end
+
+Players.PlayerAdded:Connect(setupPlayer)
+Players.PlayerRemoving:Connect(function(player)
+	clearPlayerThreat(player.UserId)
+	releaseCarriedVillager(player, false)
+end)
+
+for _, player in ipairs(Players:GetPlayers()) do
+	setupPlayer(player)
+end
+
+carryRemote.OnServerEvent:Connect(function(player, action, payload)
+	if action ~= "Throw" then
+		return
+	end
+
+	local state = CarryStateByPlayer[player.UserId]
+	if not state or not state.VillagerId or not state.Tool then
+		return
+	end
+
+	if typeof(payload) == "Vector3" then
+		state.AimPosition = payload
+	else
+		state.AimPosition = nil
+	end
+
+	releaseCarriedVillager(player, true)
+end)
+
+tradeRemote.OnServerEvent:Connect(function(player, action, payload)
+	if action ~= "Buy" then
+		return
+	end
+	if typeof(payload) ~= "table" then
+		return
+	end
+
+	local villagerId = payload.VillagerId
+	local itemId = payload.ItemId
+	if type(villagerId) ~= "string" or type(itemId) ~= "string" then
+		return
+	end
+
+	local data = Villagers[villagerId]
+	if not data or not data.Model or not data.Model.Parent then
+		return
+	end
+
+	if data.IsBaby or data.IsChild then
+		return
+	end
+
+	local item
+	for _, info in ipairs(data.Items) do
+		if info.Id == itemId then
+			item = info
+			break
+		end
+	end
+	if not item then
+		return
+	end
+
+	local coins = getCoinValue(player)
+	if not coins then
+		tradeRemote:FireClient(player, "Notify", {
+			Message = "No Coins value was found on your player.",
+			Color = Color3.fromRGB(255, 100, 100),
+		})
+		return
+	end
+
+	local discountMultiplier = 1
+	local ok, mult = pcall(function()
+		return ReputationService.GetDiscountMultiplier(player)
+	end)
+	if ok and tonumber(mult) then
+		discountMultiplier = math.clamp(tonumber(mult), 0.05, 1)
+	end
+
+	local finalCost = math.max(1, math.floor((item.Cost or 1) * discountMultiplier + 0.5))
+
+	if coins.Value < finalCost then
+		tradeRemote:FireClient(player, "Notify", {
+			Message = "You do not have enough coins for that trade.",
+			Color = Color3.fromRGB(255, 100, 100),
+		})
+		return
+	end
+
+	local templateTool = data.ToolMap[itemId]
+	if not templateTool or not templateTool:IsA("Tool") then
+		return
+	end
+
+	coins.Value -= finalCost
+	templateTool:Clone().Parent = player:WaitForChild("Backpack")
+
+	local starterGear = player:FindFirstChildOfClass("StarterGear")
+	if starterGear then
+		templateTool:Clone().Parent = starterGear
+	end
+
+	for i = #data.Items, 1, -1 do
+		if data.Items[i].Id == itemId then
+			table.remove(data.Items, i)
+			break
+		end
+	end
+	data.ToolMap[itemId] = nil
+	setVillagerRarityAttributes(data.Model, data.Items)
+
+	pcall(function()
+		ReputationService.RegisterTrade(player)
+	end)
+
+	tradeRemote:FireClient(player, "Notify", {
+		Message = "Trade completed: " .. templateTool.Name .. " for " .. finalCost .. " coins.",
+		Color = Color3.fromRGB(120, 255, 120),
+	})
+end)
+
+task.spawn(function()
+	print("[VillagerTrade] Spawn loop started.")
+	moveVillagersLightly()
+
+	while true do
+		local interval, cap = getSpawnSettings()
+		if #getRoadParts() > 0 then
+			if getActiveVillagerCount() < cap then
+				local ok, err = pcall(spawnVillager)
+				if not ok then
+					warn("[VillagerTrade] Spawn failed:", err)
+				end
+			end
+		end
+		task.wait(interval)
+	end
+end)

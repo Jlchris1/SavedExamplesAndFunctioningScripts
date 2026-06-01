@@ -1,0 +1,809 @@
+-- Voxel NPC System (server-side)
+-- Reworked for:
+-- 1) Persistent welded voxels (only unwelded/free fragments are timed-cleaned)
+-- 2) Cube-based bone core instead of cylinder
+-- 3) Exact grid fill for parts to reduce displacement / mis-scaling
+-- 4) Repeat hits deepen the wound by re-voxelizing already voxelized limbs
+-- 5) Better torso fill / carve approximation for torso-like parts
+
+local Workspace = game:GetService("Workspace")
+local Debris = game:GetService("Debris")
+
+local ROOT = script.Parent
+
+local CONFIG = {
+	SkinThickness = 0.05,
+	SkinCell = Vector3.new(0.25, 0.25, 0.05),
+	FleshCell = Vector3.new(0.25, 0.25, 0.05),
+	BoneColor = Color3.fromRGB(245, 245, 245),
+	FleshColor = Color3.fromRGB(135, 55, 50),
+	ScratchRatio = 0.02,
+	DeepRatio = 0.18,
+	SplitRatio = 0.85,
+	ThinPierceThreshold = 0.1,
+	HitMemory = 0.25,
+	MaxPlateCountPerPart = 1500,
+	VoxelLifetime = 18,
+	AutoCleanup = true,
+	Debug = false,
+}
+
+local trackedNPCs = {}
+local pendingHits = setmetatable({}, { __mode = "k" }) -- humanoid -> hit info
+local lastHealth = setmetatable({}, { __mode = "k" })
+local partStates = setmetatable({}, { __mode = "k" }) -- bodyPart -> state
+
+local function dprint(...)
+	if CONFIG.Debug then
+		print("[VoxelNPC]", ...)
+	end
+end
+
+local function clamp01(x)
+	return math.clamp(x, 0, 1)
+end
+
+local function toNumber(value, defaultValue)
+	if typeof(value) == "number" then
+		return value
+	end
+	if typeof(value) == "string" then
+		local n = tonumber(value)
+		if n ~= nil then
+			return n
+		end
+	end
+	return defaultValue
+end
+
+local function readNumber(inst, name, defaultValue)
+	if not inst then
+		return defaultValue
+	end
+
+	local attr = inst:GetAttribute(name)
+	local n = toNumber(attr, nil)
+	if n ~= nil then
+		return n
+	end
+
+	local child = inst:FindFirstChild(name)
+	if child then
+		if child:IsA("NumberValue") then
+			return child.Value
+		elseif child:IsA("StringValue") then
+			return toNumber(child.Value, defaultValue)
+		end
+	end
+
+	return defaultValue
+end
+
+local function readBool(inst, name, defaultValue)
+	if not inst then
+		return defaultValue
+	end
+
+	local attr = inst:GetAttribute(name)
+	if typeof(attr) == "boolean" then
+		return attr
+	end
+
+	local child = inst:FindFirstChild(name)
+	if child and child:IsA("BoolValue") then
+		return child.Value
+	end
+
+	return defaultValue
+end
+
+local function getAllStringValueTokens(inst, childName)
+	local set = {}
+	if not inst then
+		return set
+	end
+
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("StringValue") and d.Name == childName then
+			for token in string.gmatch(d.Value, "[^,%s]+") do
+				set[token] = true
+			end
+		end
+	end
+
+	return set
+end
+
+local function hasAnyTokens(set)
+	for _ in pairs(set) do
+		return true
+	end
+	return false
+end
+
+local function isBasePart(inst)
+	return inst and inst:IsA("BasePart")
+end
+
+local function getClosestPointOnPart(part, worldPoint)
+	local localPoint = part.CFrame:PointToObjectSpace(worldPoint)
+	local half = part.Size * 0.5
+
+	local clamped = Vector3.new(
+		math.clamp(localPoint.X, -half.X, half.X),
+		math.clamp(localPoint.Y, -half.Y, half.Y),
+		math.clamp(localPoint.Z, -half.Z, half.Z)
+	)
+
+	return part.CFrame:PointToWorldSpace(clamped)
+end
+
+local function getDirectionToPart(fromPart, toPosition)
+	local p = getClosestPointOnPart(fromPart, toPosition)
+	local dir = (p - toPosition)
+	if dir.Magnitude < 0.001 then
+		return Vector3.new(0, 1, 0), p
+	end
+	return dir.Unit, p
+end
+
+local function getHumanoid(model)
+	if not model then
+		return nil
+	end
+	return model:FindFirstChildOfClass("Humanoid")
+end
+
+local function isNPCModel(model)
+	local hum = getHumanoid(model)
+	return hum and model:IsA("Model")
+end
+
+local function isLimbName(name)
+	name = string.lower(name)
+	return string.find(name, "arm", 1, true)
+		or string.find(name, "leg", 1, true)
+		or string.find(name, "hand", 1, true)
+		or string.find(name, "foot", 1, true)
+		or string.find(name, "limb", 1, true)
+end
+
+local function isTorsoLike(part)
+	local n = string.lower(part.Name)
+	return string.find(n, "torso", 1, true)
+		or string.find(n, "uppertorso", 1, true)
+		or string.find(n, "lowertorso", 1, true)
+		or string.find(n, "chest", 1, true)
+		or string.find(n, "abdomen", 1, true)
+end
+
+local function majorAxis(size)
+	if size.X >= size.Y and size.X >= size.Z then
+		return "X"
+	elseif size.Y >= size.X and size.Y >= size.Z then
+		return "Y"
+	else
+		return "Z"
+	end
+end
+
+local function axisRotationForCylinder(axis)
+	if axis == "X" then
+		return CFrame.Angles(0, 0, math.rad(90))
+	elseif axis == "Z" then
+		return CFrame.Angles(math.rad(90), 0, 0)
+	end
+	return CFrame.new()
+end
+
+local function partIsThin(part)
+	local s = part.Size
+	return math.min(s.X, s.Y, s.Z) < CONFIG.ThinPierceThreshold
+end
+
+local function createVoxelPart(parent, size, cf, color, material, transparency, reflectance, canCollide, weldTarget)
+	local p = Instance.new("Part")
+	p.Anchored = false
+	p.CanCollide = canCollide or false
+	p.CanTouch = false
+	p.CanQuery = false
+	p.Size = size
+	p.CFrame = cf
+	p.Color = color
+	p.Material = material or Enum.Material.Plastic
+	p.Transparency = transparency or 0
+	p.Reflectance = reflectance or 0
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Name = "VoxelPiece"
+	p.Massless = true
+	p.Parent = parent
+
+	if weldTarget and weldTarget:IsA("BasePart") then
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = p
+		weld.Part1 = weldTarget
+		weld.Parent = p
+		p:SetAttribute("VoxelWelded", true)
+	else
+		p:SetAttribute("VoxelWelded", false)
+		Debris:AddItem(p, CONFIG.VoxelLifetime)
+	end
+
+	return p
+end
+
+local function makeAnchorRoot(model, cf)
+	local root = Instance.new("Part")
+	root.Name = "VoxelAnchor"
+	root.Anchored = false
+	root.CanCollide = false
+	root.CanTouch = false
+	root.CanQuery = false
+	root.Transparency = 1
+	root.Size = Vector3.new(0.2, 0.2, 0.2)
+	root.CFrame = cf
+	root.Massless = true
+	root.Parent = model
+	return root
+end
+
+local function hideOriginalPart(part)
+	part.Transparency = 1
+	part.CastShadow = false
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+end
+
+local function axisGrid(length, targetCell)
+	local count = math.max(1, math.floor((length / math.max(0.001, targetCell)) + 0.5))
+	local step = length / count
+	return count, step
+end
+
+local function localCellCFrame(baseCF, localPos)
+	return baseCF * CFrame.new(localPos)
+end
+
+local function torsoMask(localPos, half)
+	-- A tapered ellipsoid-ish approximation that helps common torso parts look less boxy.
+	local x = localPos.X / math.max(0.001, half.X)
+	local y = localPos.Y / math.max(0.001, half.Y)
+	local z = localPos.Z / math.max(0.001, half.Z)
+
+	local upperBoost = 1.0 + math.max(0, y) * 0.18
+	local lowerTaper = 1.0 - math.max(0, -y) * 0.22
+	local waistDip = 0.78 + 0.22 * (1 - math.abs(y))
+
+	local rx = math.max(0.35, upperBoost * lowerTaper * waistDip)
+	local rz = math.max(0.35, (1.0 + math.max(0, y) * 0.12) * waistDip)
+
+	local v = (x * x) / (rx * rx) + (z * z) / (rz * rz)
+	return v <= 1.0
+end
+
+local function pointInsideBodyShape(part, localPos)
+	local half = part.Size * 0.5
+	if isTorsoLike(part) then
+		return torsoMask(localPos, half)
+	end
+	return math.abs(localPos.X) <= half.X and math.abs(localPos.Y) <= half.Y and math.abs(localPos.Z) <= half.Z
+end
+
+local function nearestBoundaryDist(localPos, half)
+	return math.min(
+		half.X - math.abs(localPos.X),
+		half.Y - math.abs(localPos.Y),
+		half.Z - math.abs(localPos.Z)
+	)
+end
+
+local function createCubeBone(model, originalPart, attachTarget)
+	local axis = majorAxis(originalPart.Size)
+	local s = originalPart.Size
+	local minSide = math.min(s.X, s.Y, s.Z)
+	local cubeSide = math.clamp(minSide * 0.22, 0.08, 0.35)
+	local halfLen = math.max(s.X, s.Y, s.Z) * 0.35
+	local count = math.max(1, math.floor((halfLen * 2) / cubeSide + 0.5))
+	local step = (halfLen * 2) / count
+
+	for i = 1, count do
+		local offset = -halfLen + step * (i - 0.5)
+		local localOffset = Vector3.new()
+		if axis == "X" then
+			localOffset = Vector3.new(offset, 0, 0)
+		elseif axis == "Y" then
+			localOffset = Vector3.new(0, offset, 0)
+		else
+			localOffset = Vector3.new(0, 0, offset)
+		end
+
+		local cube = Instance.new("Part")
+		cube.Name = "Bone"
+		cube.Shape = Enum.PartType.Block
+		cube.Size = Vector3.new(cubeSide, cubeSide, cubeSide)
+		cube.Color = CONFIG.BoneColor
+		cube.Material = Enum.Material.SmoothPlastic
+		cube.Transparency = 0
+		cube.CanCollide = false
+		cube.CanTouch = false
+		cube.CanQuery = false
+		cube.Anchored = false
+		cube.Massless = true
+		cube.CFrame = originalPart.CFrame * CFrame.new(localOffset)
+		cube.Parent = model
+
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = cube
+		weld.Part1 = attachTarget
+		weld.Parent = cube
+	end
+end
+
+local function buildVoxelBody(model, originalPart, hitPos, hitDir, damageRatio, split)
+	local partCF = originalPart.CFrame
+	local size = originalPart.Size
+	local half = size * 0.5
+	local localHit = partCF:PointToObjectSpace(hitPos)
+	local localDir = partCF:VectorToObjectSpace(hitDir)
+
+	if localDir.Magnitude < 0.001 then
+		localDir = Vector3.new(0, 1, 0)
+	else
+		localDir = localDir.Unit
+	end
+
+	local voxelFolder = Instance.new("Folder")
+	voxelFolder.Name = "VoxelBody"
+	voxelFolder.Parent = originalPart
+
+	local attachedRoot = originalPart
+	local detachedRoot = nil
+	if split then
+		detachedRoot = makeAnchorRoot(model, originalPart.CFrame)
+	end
+
+	local function shouldDetach(localPos)
+		local rel = localPos - localHit
+		return rel:Dot(localDir) > 0
+	end
+
+	local carveRadius = math.clamp(
+		0.22 + (damageRatio * math.max(size.X, size.Y, size.Z) * 0.95),
+		0.22,
+		math.max(size.X, size.Y, size.Z) * 0.58
+	)
+
+	local fleshRadius = carveRadius * 0.72
+	local thinPierce = partIsThin(originalPart)
+	local torsoLike = isTorsoLike(originalPart)
+
+	local countX, stepX = axisGrid(size.X, CONFIG.SkinCell.X)
+	local countY, stepY = axisGrid(size.Y, CONFIG.SkinCell.Y)
+	local countZ, stepZ = axisGrid(size.Z, CONFIG.SkinCell.Z)
+
+	local plateCount = 0
+	local function addCell(localPos, cellSize, color, material, weldTarget)
+		if plateCount >= CONFIG.MaxPlateCountPerPart then
+			return
+		end
+		local worldCF = localCellCFrame(partCF, localPos)
+		createVoxelPart(voxelFolder, cellSize, worldCF, color, material or Enum.Material.Plastic, 0, 0, false, weldTarget)
+		plateCount += 1
+	end
+
+	local function cellWeldTarget(localPos)
+		if not split or not detachedRoot then
+			return attachedRoot
+		end
+		if shouldDetach(localPos) then
+			return detachedRoot
+		end
+		return attachedRoot
+	end
+
+	-- Fill the full body volume with exact-sized cubes, then carve the wound out of it.
+	-- Surface = original color, inner layer = flesh, central limb core = bone cubes.
+	for ix = 1, countX do
+		local x = -half.X + stepX * (ix - 0.5)
+		for iy = 1, countY do
+			local y = -half.Y + stepY * (iy - 0.5)
+			for iz = 1, countZ do
+				local z = -half.Z + stepZ * (iz - 0.5)
+				local localPos = Vector3.new(x, y, z)
+
+				if pointInsideBodyShape(originalPart, localPos) then
+					local d = (localPos - localHit).Magnitude
+					if d > carveRadius then
+						local halfCell = Vector3.new(stepX, stepY, stepZ)
+						local boundary = nearestBoundaryDist(localPos, half)
+
+						local color = originalPart.Color
+						local material = originalPart.Material
+
+						if boundary > CONFIG.SkinThickness * 2.0 then
+							color = CONFIG.FleshColor
+							material = Enum.Material.SmoothPlastic
+						end
+
+						if boundary > CONFIG.SkinThickness * 3.0 then
+							-- Bone-like central core for limbs.
+							if isLimbName(originalPart.Name) then
+								local axis = majorAxis(size)
+								local coreRadius = math.min(half.X, half.Y, half.Z) * 0.22
+								local radial = 0
+								if axis == "X" then
+									radial = math.sqrt(y * y + z * z)
+								elseif axis == "Y" then
+									radial = math.sqrt(x * x + z * z)
+								else
+									radial = math.sqrt(x * x + y * y)
+								end
+								if radial <= coreRadius then
+									color = CONFIG.BoneColor
+									material = Enum.Material.SmoothPlastic
+								end
+							end
+						end
+
+						local target = cellWeldTarget(localPos)
+						addCell(localPos, halfCell, color, material, target)
+					end
+				end
+			end
+		end
+	end
+
+	-- Dedicated cube bone stack makes the bone visually cube-based instead of cylindrical.
+	if isLimbName(originalPart.Name) or (math.max(size.X, size.Y, size.Z) / math.max(0.001, math.min(size.X, size.Y, size.Z)) >= 1.4) then
+		createCubeBone(model, originalPart, attachedRoot)
+	end
+
+	if split and detachedRoot then
+		detachedRoot.AssemblyLinearVelocity = originalPart.AssemblyLinearVelocity
+		Debris:AddItem(detachedRoot, CONFIG.VoxelLifetime)
+	end
+
+	return voxelFolder
+end
+
+local function destroyVoxelFolder(bodyPart)
+	local state = partStates[bodyPart]
+	if not state then
+		return
+	end
+	if state.folder and state.folder.Parent then
+		state.folder:Destroy()
+	end
+	state.folder = nil
+end
+
+local function carveExistingWeldedVoxels(bodyPart, hitPos, damageRatio)
+	local state = partStates[bodyPart]
+	if not state or not state.folder or not state.folder.Parent then
+		return
+	end
+
+	local localHit = bodyPart.CFrame:PointToObjectSpace(hitPos)
+	local half = bodyPart.Size * 0.5
+	local carveRadius = math.clamp(
+		0.15 + (damageRatio * math.max(bodyPart.Size.X, bodyPart.Size.Y, bodyPart.Size.Z) * 0.6),
+		0.15,
+		math.max(bodyPart.Size.X, bodyPart.Size.Y, bodyPart.Size.Z) * 0.45
+	)
+
+	for _, inst in ipairs(state.folder:GetDescendants()) do
+		if inst:IsA("BasePart") and inst.Name == "VoxelPiece" then
+			local lp = bodyPart.CFrame:PointToObjectSpace(inst.Position)
+			local dist = (lp - localHit).Magnitude
+			if dist <= carveRadius then
+				local weld = inst:FindFirstChildOfClass("WeldConstraint")
+				if weld then
+					weld:Destroy()
+				end
+				inst:SetAttribute("VoxelWelded", false)
+				inst.CanCollide = true
+				inst.CanTouch = true
+				inst.CanQuery = true
+				Debris:AddItem(inst, CONFIG.VoxelLifetime)
+			end
+		end
+	end
+end
+
+local function voxelizeBodyPart(model, humanoid, bodyPart, hitPos, hitDir, damageAmount, sourcePart)
+	if not isBasePart(bodyPart) then
+		return
+	end
+
+	local state = partStates[bodyPart]
+	if not state then
+		state = {
+			damage = 0,
+			folder = nil,
+			voxelized = false,
+		}
+		partStates[bodyPart] = state
+	end
+
+	local added = math.max(0, damageAmount or 0)
+	if added <= 0 then
+		return
+	end
+
+	state.damage = math.clamp(state.damage + added, 0, humanoid.MaxHealth)
+	local ratio = 0
+	if humanoid.MaxHealth > 0 then
+		ratio = clamp01(state.damage / humanoid.MaxHealth)
+	end
+
+	-- If the part has already been voxelized, open the old wound first, then rebuild more aggressively.
+	if state.voxelized and state.folder and state.folder.Parent then
+		carveExistingWeldedVoxels(bodyPart, hitPos, ratio)
+		destroyVoxelFolder(bodyPart)
+	end
+
+	hideOriginalPart(bodyPart)
+
+	local split = ratio >= CONFIG.SplitRatio
+	if partIsThin(bodyPart) then
+		split = false
+	end
+
+	state.folder = buildVoxelBody(model, bodyPart, hitPos, hitDir, ratio, split)
+	state.voxelized = true
+
+	local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+	if root and root:IsA("BasePart") then
+		local push = hitDir * math.clamp(bodyPart.AssemblyMass * math.max(1, damageAmount) * 0.06, 0, 150)
+		root:ApplyImpulse(push * root.AssemblyMass)
+	end
+end
+
+local function applyVoxelHit(model, humanoid, bodyPart, hitPos, hitDir, damageAmount, sourcePart, kind)
+	if not model or not humanoid or humanoid.Health <= 0 then
+		return
+	end
+	if not isBasePart(bodyPart) then
+		return
+	end
+
+	damageAmount = math.max(0, damageAmount or 0)
+	if damageAmount <= 0 then
+		return
+	end
+
+	voxelizeBodyPart(model, humanoid, bodyPart, hitPos, hitDir, damageAmount, sourcePart)
+end
+
+local function isToolHitSource(other)
+	local tool = other and other:FindFirstAncestorOfClass("Tool")
+	if not tool then
+		return nil, false
+	end
+
+	local voxelHit = readBool(tool, "VoxelHit", false)
+	if not voxelHit then
+		return tool, false
+	end
+
+	local allowed = getAllStringValueTokens(tool, "VoxelHitPart")
+	if not hasAnyTokens(allowed) then
+		return tool, true
+	end
+
+	local function matchesName(partName)
+		if allowed[partName] then
+			return true
+		end
+		for token in pairs(allowed) do
+			if string.find(partName, token, 1, true) then
+				return true
+			end
+		end
+		return false
+	end
+
+	if matchesName(other.Name) then
+		return tool, true
+	end
+
+	return tool, false
+end
+
+local function isVelocityVoxelizingPart(part)
+	if not isBasePart(part) then
+		return false
+	end
+	if readBool(part, "Voxelizing", false) then
+		return true
+	end
+	if part.Parent and readBool(part.Parent, "Voxelizing", false) then
+		return true
+	end
+	return false
+end
+
+local function getVelocityDamage(part)
+	local dpv = readNumber(part, "DamagePerVelocity", nil)
+	if dpv == nil and part.Parent then
+		dpv = readNumber(part.Parent, "DamagePerVelocity", nil)
+	end
+	if dpv == nil then
+		return nil
+	end
+
+	local massMul = readNumber(part, "MassMultiplying", 1)
+	if massMul == 1 and part.Parent then
+		massMul = readNumber(part.Parent, "MassMultiplying", 1)
+	end
+
+	local speed = part.AssemblyLinearVelocity.Magnitude
+	local mass = part.AssemblyMass
+	return mass * massMul * speed * dpv
+end
+
+local function getCharacterFromPart(part)
+	if not isBasePart(part) then
+		return nil
+	end
+	local model = part:FindFirstAncestorOfClass("Model")
+	if model and isNPCModel(model) then
+		return model
+	end
+	return nil
+end
+
+local function registerNPC(model)
+	if not isNPCModel(model) or trackedNPCs[model] then
+		return
+	end
+
+	local humanoid = getHumanoid(model)
+	if not humanoid then
+		return
+	end
+
+	trackedNPCs[model] = true
+	lastHealth[humanoid] = humanoid.Health
+
+	local partConnections = {}
+	local healthConn
+
+	local function queueHit(bodyPart, hitPos, hitDir, sourcePart, sourceKind, predictedDamage)
+		pendingHits[humanoid] = {
+			part = bodyPart,
+			pos = hitPos,
+			dir = hitDir,
+			source = sourcePart,
+			kind = sourceKind,
+			predictedDamage = predictedDamage,
+			time = os.clock(),
+		}
+	end
+
+	for _, inst in ipairs(model:GetDescendants()) do
+		if inst:IsA("BasePart") then
+			local part = inst
+
+			local conn = part.Touched:Connect(function(other)
+				if not other or not other:IsA("BasePart") then
+					return
+				end
+				if humanoid.Health <= 0 then
+					return
+				end
+				if other:IsDescendantOf(model) then
+					return
+				end
+
+				local tool, toolHitAllowed = isToolHitSource(other)
+				if tool then
+					local hitPos = getClosestPointOnPart(part, other.Position)
+					local hitDir = select(1, getDirectionToPart(part, other.Position))
+
+					if toolHitAllowed then
+						local predicted = readNumber(tool, "Damage", nil)
+						if predicted == nil then
+							predicted = readNumber(tool, "AttackDamage", nil)
+						end
+						queueHit(part, hitPos, hitDir, other, "tool", predicted)
+					end
+				end
+
+				if isVelocityVoxelizingPart(other) then
+					local vDamage = getVelocityDamage(other)
+					if vDamage and vDamage > 0 then
+						local hitPos = getClosestPointOnPart(part, other.Position)
+						local hitDir = other.AssemblyLinearVelocity.Magnitude > 0.001 and other.AssemblyLinearVelocity.Unit or select(1, getDirectionToPart(part, other.Position))
+						queueHit(part, hitPos, hitDir, other, "velocity", vDamage)
+
+						if humanoid.Health > 0 then
+							humanoid:TakeDamage(vDamage)
+						end
+					end
+				end
+			end)
+
+			table.insert(partConnections, conn)
+		end
+	end
+
+	healthConn = humanoid.HealthChanged:Connect(function(newHealth)
+		local oldHealth = lastHealth[humanoid] or newHealth
+		if newHealth < oldHealth then
+			local actualDamage = oldHealth - newHealth
+			local hit = pendingHits[humanoid]
+
+			if hit and (os.clock() - hit.time) <= CONFIG.HitMemory then
+				local dmg = actualDamage
+				if dmg <= 0 and hit.predictedDamage then
+					dmg = hit.predictedDamage
+				end
+
+				if dmg > 0 then
+					applyVoxelHit(model, humanoid, hit.part, hit.pos, hit.dir, dmg, hit.source, hit.kind)
+				end
+			end
+		end
+
+		lastHealth[humanoid] = newHealth
+	end)
+
+	humanoid.Died:Connect(function()
+		pendingHits[humanoid] = nil
+	end)
+
+	model.AncestryChanged:Connect(function(_, parent)
+		if not parent and CONFIG.AutoCleanup then
+			for _, c in ipairs(partConnections) do
+				pcall(function()
+					c:Disconnect()
+				end)
+			end
+			if healthConn then
+				pcall(function()
+					healthConn:Disconnect()
+				end)
+			end
+			trackedNPCs[model] = nil
+		end
+	end)
+
+	dprint("Registered NPC:", model:GetFullName())
+end
+
+local function scanForNPCs(parent)
+	for _, inst in ipairs(parent:GetDescendants()) do
+		if inst:IsA("Model") and isNPCModel(inst) then
+			registerNPC(inst)
+		end
+	end
+end
+
+-- Initial scan
+if ROOT:IsA("Model") and isNPCModel(ROOT) then
+	registerNPC(ROOT)
+elseif ROOT:IsA("BasePart") then
+	local model = ROOT:FindFirstAncestorOfClass("Model")
+	if model and isNPCModel(model) then
+		registerNPC(model)
+	end
+else
+	scanForNPCs(Workspace)
+end
+
+-- Auto-register future NPCs
+Workspace.DescendantAdded:Connect(function(inst)
+	if inst:IsA("Humanoid") then
+		local model = inst.Parent
+		if model and model:IsA("Model") then
+			task.defer(function()
+				registerNPC(model)
+			end)
+		end
+	end
+end)
+
+print("[VoxelNPC] Ready.")

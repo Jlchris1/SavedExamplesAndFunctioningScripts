@@ -1,0 +1,1068 @@
+-- My World
+-- Tool: Maximum Annihilation
+-- LocalScript for StarterPlayerScripts
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local localPlayer = Players.LocalPlayer
+if not localPlayer then
+	return
+end
+
+local TOOL_NAME = "Maximum Annihilation"
+local TOOL_MARKER = "__MyWorldWired"
+
+local ORB_RADIUS = 120
+local ORB_BLAST_DAMAGE = 9e37
+local ORB_BLAST_KNOCKBACK = 800
+
+local HOLD_MAX_RADIUS = 2048
+local HOLD_MAX_TIME = 5
+local HOLD_UPDATE_DT = 0.08
+
+local HOLD_HIGHLIGHT_COLOR = Color3.fromRGB(255, 0, 0)
+local HOLD_DARK_GRAY = Color3.fromRGB(48, 48, 48)
+
+local toolInstance = nil
+local mouse = nil
+
+local gui = nil
+local topBar = nil
+local shootButton = nil
+local holdButton = nil
+local topLabel = nil
+local countLabel = nil
+local uiScale = nil
+
+local equipped = false
+local holding = false
+local releasing = false
+local holdSession = 0
+
+local holdStartCFrame = nil
+local holdCenter = nil
+local holdRadius = 0
+
+local holdSphereFolder = nil
+local holdVisualRoot = nil
+local holdVisualLayers = {}
+local holdVisualCore = nil
+
+local caughtHighlights = {}
+local currentCaught = {}
+local trackedWalkSpeeds = {}
+
+local function getCharacter()
+	return localPlayer.Character
+end
+
+local function getHumanoid()
+	local char = getCharacter()
+	return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function getHRP()
+	local char = getCharacter()
+	return char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso"))
+end
+
+local function isPlayerCharacter(model)
+	return model and model:IsA("Model") and Players:GetPlayerFromCharacter(model) ~= nil
+end
+
+local function isNPCModel(model)
+	if not model or not model:IsA("Model") then
+		return false
+	end
+	if isPlayerCharacter(model) then
+		return false
+	end
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	return hum ~= nil and hum.Health > 0
+end
+
+local function getRootPart(model)
+	if not model then
+		return nil
+	end
+	return model:FindFirstChild("HumanoidRootPart")
+		or model:FindFirstChild("UpperTorso")
+		or model:FindFirstChild("Torso")
+end
+
+local function getAimPosition()
+	if mouse and mouse.Hit then
+		return mouse.Hit.Position
+	end
+
+	local hrp = getHRP()
+	if hrp then
+		return hrp.Position + hrp.CFrame.LookVector * 120
+	end
+
+	local cam = Workspace.CurrentCamera
+	if cam then
+		return cam.CFrame.Position + cam.CFrame.LookVector * 120
+	end
+
+	return Vector3.new(0, 50, 0)
+end
+
+local function ensureTool()
+	local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+	if not backpack then
+		return nil
+	end
+
+	local existing = backpack:FindFirstChild(TOOL_NAME)
+	if existing and existing:IsA("Tool") then
+		return existing
+	end
+
+	local char = getCharacter()
+	if char then
+		local inChar = char:FindFirstChild(TOOL_NAME)
+		if inChar and inChar:IsA("Tool") then
+			return inChar
+		end
+	end
+
+	local tool = Instance.new("Tool")
+	tool.Name = TOOL_NAME
+	tool.RequiresHandle = false
+	tool.CanBeDropped = false
+	tool.Parent = backpack
+	return tool
+end
+
+local function updateUIScale()
+	if not uiScale or not Workspace.CurrentCamera then
+		return
+	end
+
+	local v = Workspace.CurrentCamera.ViewportSize
+	local shortest = math.max(320, math.min(v.X, v.Y))
+	uiScale.Scale = math.clamp(shortest / 900, 0.75, 1.08)
+end
+
+local function updateUI()
+	if not gui then
+		return
+	end
+
+	local visible = equipped
+	if topBar then
+		topBar.Visible = visible
+	end
+	if shootButton then
+		shootButton.Visible = visible and not releasing
+	end
+	if holdButton then
+		holdButton.Visible = visible and not releasing
+	end
+	if topLabel then
+		topLabel.Visible = visible and (holding or releasing)
+	end
+	if countLabel then
+		countLabel.Visible = visible and (holding or releasing)
+	end
+end
+
+local function clearCaughtHighlights()
+	for model, hl in pairs(caughtHighlights) do
+		if hl and hl.Parent then
+			pcall(function()
+				hl:Destroy()
+			end)
+		end
+		caughtHighlights[model] = nil
+	end
+end
+
+local function setCaughtHighlight(model, enabled)
+	if enabled then
+		if not caughtHighlights[model] then
+			local hl = Instance.new("Highlight")
+			hl.Name = "MyWorldCaughtHighlight"
+			hl.Adornee = model
+			hl.FillTransparency = 1
+			hl.OutlineTransparency = 0
+			hl.OutlineColor = HOLD_HIGHLIGHT_COLOR
+			hl.Parent = model
+			caughtHighlights[model] = hl
+		end
+	else
+		local hl = caughtHighlights[model]
+		if hl then
+			pcall(function()
+				hl:Destroy()
+			end)
+			caughtHighlights[model] = nil
+		end
+	end
+end
+
+local function getNPCsWithinRadius(center, radius)
+	local list = {}
+	for _, desc in ipairs(Workspace:GetDescendants()) do
+		if desc:IsA("Humanoid") then
+			local model = desc.Parent
+			if isNPCModel(model) then
+				local root = getRootPart(model)
+				if root and root:IsA("BasePart") then
+					if (root.Position - center).Magnitude <= radius then
+						table.insert(list, model)
+					end
+				end
+			end
+		end
+	end
+	return list
+end
+
+local function getPlayerClosestToPoint(point)
+	local bestPlayer = nil
+	local bestDist = math.huge
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local char = plr.Character
+		local root = char and getRootPart(char)
+		if root and root:IsA("BasePart") then
+			local d = (root.Position - point).Magnitude
+			if d < bestDist then
+				bestDist = d
+				bestPlayer = plr
+			end
+		end
+	end
+
+	return bestPlayer, bestDist
+end
+
+local function clusterNPCs(models, threshold)
+	local remaining = {}
+	for _, model in ipairs(models) do
+		if model and model.Parent then
+			remaining[model] = true
+		end
+	end
+
+	local clusters = {}
+
+	local function rootPos(model)
+		local root = getRootPart(model)
+		return root and root.Position or nil
+	end
+
+	while next(remaining) do
+		local seed = next(remaining)
+		remaining[seed] = nil
+
+		local cluster = { seed }
+		local expanded = true
+
+		while expanded do
+			expanded = false
+			for model in pairs(remaining) do
+				local pos = rootPos(model)
+				if pos then
+					for _, c in ipairs(cluster) do
+						local cPos = rootPos(c)
+						if cPos and (pos - cPos).Magnitude <= threshold then
+							table.insert(cluster, model)
+							remaining[model] = nil
+							expanded = true
+							break
+						end
+					end
+				end
+			end
+		end
+
+		table.insert(clusters, cluster)
+	end
+
+	table.sort(clusters, function(a, b)
+		local function centerOf(cluster)
+			local sum = Vector3.new(0, 0, 0)
+			local count = 0
+			for _, m in ipairs(cluster) do
+				local p = rootPos(m)
+				if p then
+					sum += p
+					count += 1
+				end
+			end
+			return count > 0 and (sum / count) or Vector3.new(0, 0, 0)
+		end
+
+		local hrp = getHRP()
+		local p = hrp and hrp.Position or Vector3.new(0, 0, 0)
+		return (centerOf(a) - p).Magnitude < (centerOf(b) - p).Magnitude
+	end)
+
+	return clusters
+end
+
+local function updateHoldOverlay(sizeStuds, count)
+	if topLabel then
+		topLabel.Text = ("Sphere Size: %d studs"):format(math.floor(sizeStuds + 0.5))
+	end
+	if countLabel then
+		countLabel.Text = ("Caught NPCs: %d"):format(count)
+	end
+end
+
+local function restoreTrackedSpeeds()
+	for hum, original in pairs(trackedWalkSpeeds) do
+		if hum and hum.Parent then
+			pcall(function()
+				hum.WalkSpeed = original
+			end)
+		end
+		trackedWalkSpeeds[hum] = nil
+	end
+end
+
+local function setNPCSlow(model, center, radius)
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	local root = getRootPart(model)
+	if not hum or not root or hum.Health <= 0 then
+		return
+	end
+
+	if trackedWalkSpeeds[hum] == nil then
+		trackedWalkSpeeds[hum] = hum.WalkSpeed
+	end
+
+	local original = trackedWalkSpeeds[hum] or hum.WalkSpeed
+	local dist = (root.Position - center).Magnitude
+
+	local newSpeed = original
+	if dist <= 80 then
+		newSpeed = 0
+	elseif radius <= 80 then
+		newSpeed = 0
+	else
+		local alpha = math.clamp((dist - 80) / math.max(radius - 80, 1), 0, 1)
+		newSpeed = original * alpha
+	end
+
+	pcall(function()
+		hum.WalkSpeed = newSpeed
+	end)
+end
+
+local function destroyHoldVisual()
+	if holdSphereFolder and holdSphereFolder.Parent then
+		holdSphereFolder:Destroy()
+	end
+
+	holdSphereFolder = nil
+	holdVisualRoot = nil
+	holdVisualLayers = {}
+	holdVisualCore = nil
+end
+
+local function fadeAndDestroyHoldVisual()
+	for _, obj in ipairs(holdVisualLayers) do
+		if obj and obj.Parent and obj:IsA("BasePart") then
+			pcall(function()
+				TweenService:Create(obj, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+					Transparency = 1,
+				}):Play()
+			end)
+		end
+	end
+
+	if holdVisualCore and holdVisualCore.Parent and holdVisualCore:IsA("BasePart") then
+		pcall(function()
+			TweenService:Create(holdVisualCore, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+				Transparency = 1,
+			}):Play()
+		end)
+	end
+
+	task.wait(0.4)
+	destroyHoldVisual()
+end
+
+local function createHoldVisual()
+	destroyHoldVisual()
+
+	holdSphereFolder = Instance.new("Folder")
+	holdSphereFolder.Name = "MyWorldHoldFX"
+	holdSphereFolder.Parent = Workspace
+
+	local position = holdCenter or (getHRP() and getHRP().Position) or Vector3.new(0, 0, 0)
+
+	holdVisualRoot = Instance.new("Part")
+	holdVisualRoot.Name = "HoldVisualRoot"
+	holdVisualRoot.Anchored = true
+	holdVisualRoot.CanCollide = false
+	holdVisualRoot.CanTouch = false
+	holdVisualRoot.CanQuery = false
+	holdVisualRoot.CastShadow = false
+	holdVisualRoot.Transparency = 1
+	holdVisualRoot.Size = Vector3.new(1, 1, 1)
+	holdVisualRoot.CFrame = CFrame.new(position)
+	holdVisualRoot.Parent = holdSphereFolder
+
+	local function newLayer(name, transparency)
+		local p = Instance.new("Part")
+		p.Name = name
+		p.Shape = Enum.PartType.Ball
+		p.Anchored = false
+		p.CanCollide = false
+		p.CanTouch = false
+		p.CanQuery = false
+		p.CastShadow = false
+		p.Material = Enum.Material.ForceField
+		p.Color = HOLD_DARK_GRAY
+		p.Transparency = transparency
+		p.Size = Vector3.new(16, 16, 16)
+		p.CFrame = CFrame.new(position)
+		p.Parent = holdSphereFolder
+
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = holdVisualRoot
+		weld.Part1 = p
+		weld.Parent = p
+
+		return p
+	end
+
+	-- The core stays fully transparent, while the shockwave is built from 3 ForceField layers.
+	holdVisualCore = Instance.new("Part")
+	holdVisualCore.Name = "HoldCore"
+	holdVisualCore.Shape = Enum.PartType.Ball
+	holdVisualCore.Anchored = false
+	holdVisualCore.CanCollide = false
+	holdVisualCore.CanTouch = false
+	holdVisualCore.CanQuery = false
+	holdVisualCore.CastShadow = false
+	holdVisualCore.Material = Enum.Material.ForceField
+	holdVisualCore.Color = HOLD_DARK_GRAY
+	holdVisualCore.Transparency = 1
+	holdVisualCore.Size = Vector3.new(14, 14, 14)
+	holdVisualCore.CFrame = CFrame.new(position)
+	holdVisualCore.Parent = holdSphereFolder
+
+	local coreWeld = Instance.new("WeldConstraint")
+	coreWeld.Part0 = holdVisualRoot
+	coreWeld.Part1 = holdVisualCore
+	coreWeld.Parent = holdVisualCore
+
+	local layer1 = newLayer("Layer1", 0.75)
+	local layer2 = newLayer("Layer2", 0.84)
+	local layer3 = newLayer("Layer3", 0.91)
+
+	holdVisualLayers = { layer1, layer2, layer3 }
+end
+
+local function updateHoldVisual(position, radius)
+	if not holdSphereFolder or not holdSphereFolder.Parent then
+		return
+	end
+
+	if holdVisualRoot and holdVisualRoot.Parent then
+		holdVisualRoot.CFrame = CFrame.new(position)
+	end
+
+	local base = radius * 2
+	local sizes = {
+		Vector3.new(base, base, base),
+		Vector3.new(base * 0.965, base * 0.965, base * 0.965),
+		Vector3.new(base * 0.93, base * 0.93, base * 0.93),
+	}
+
+	for i, layer in ipairs(holdVisualLayers) do
+		if layer and layer.Parent then
+			layer.Size = sizes[i] or sizes[#sizes]
+			layer.CFrame = CFrame.new(position)
+		end
+	end
+
+	if holdVisualCore and holdVisualCore.Parent then
+		holdVisualCore.CFrame = CFrame.new(position)
+		holdVisualCore.Size = Vector3.new(base * 0.88, base * 0.88, base * 0.88)
+	end
+end
+
+local function orbBlast()
+	local hrp = getHRP()
+	if not hrp then
+		return
+	end
+
+	local blastPos = getAimPosition()
+
+	-- Keep the click explosion behavior the same as before
+	local folder = Instance.new("Folder")
+	folder.Name = "MyWorldOrbFX"
+	folder.Parent = Workspace
+
+	local outer = Instance.new("Part")
+	outer.Name = "OuterOrb"
+	outer.Shape = Enum.PartType.Ball
+	outer.Anchored = true
+	outer.CanCollide = false
+	outer.CastShadow = false
+	outer.Material = Enum.Material.SmoothPlastic
+	outer.Color = Color3.fromRGB(34, 34, 34)
+	outer.Transparency = 0.15
+	outer.Size = Vector3.new(4, 4, 4)
+	outer.CFrame = CFrame.new(blastPos)
+	outer.Parent = folder
+
+	local inner = Instance.new("Part")
+	inner.Name = "InnerNegatedCenter"
+	inner.Shape = Enum.PartType.Ball
+	inner.Anchored = true
+	inner.CanCollide = false
+	inner.CastShadow = false
+	inner.Material = Enum.Material.SmoothPlastic
+	inner.Color = Color3.fromRGB(0, 0, 0)
+	inner.Transparency = 0
+	inner.Size = Vector3.new(1.5, 1.5, 1.5)
+	inner.CFrame = CFrame.new(blastPos)
+	inner.Parent = folder
+
+	local expandTween = TweenInfo.new(1.2 * 0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local finalSize = Vector3.new(ORB_RADIUS * 2, ORB_RADIUS * 2, ORB_RADIUS * 2)
+
+	TweenService:Create(outer, expandTween, {
+		Size = finalSize,
+		Transparency = 0.32,
+	}):Play()
+
+	TweenService:Create(inner, expandTween, {
+		Size = Vector3.new(ORB_RADIUS * 1.44, ORB_RADIUS * 1.44, ORB_RADIUS * 1.44),
+		Transparency = 0,
+	}):Play()
+
+	task.delay(1.2, function()
+		if folder and folder.Parent then
+			folder:Destroy()
+		end
+	end)
+
+	for _, desc in ipairs(Workspace:GetDescendants()) do
+		if desc:IsA("Humanoid") then
+			local model = desc.Parent
+			if isNPCModel(model) then
+				local root = getRootPart(model)
+				if root and root:IsA("BasePart") then
+					local dist = (root.Position - blastPos).Magnitude
+					if dist <= ORB_RADIUS then
+						local dir = (root.Position - blastPos)
+						if dir.Magnitude < 0.001 then
+							dir = Vector3.new(0, 1, 0)
+						else
+							dir = dir.Unit
+						end
+
+						pcall(function()
+							root.AssemblyLinearVelocity = dir * ORB_BLAST_KNOCKBACK + Vector3.new(0, ORB_BLAST_KNOCKBACK * 0.25, 0)
+							root.AssemblyAngularVelocity = Vector3.new(math.random(-15, 15), math.random(-15, 15), math.random(-15, 15))
+						end)
+
+						pcall(function()
+							desc:TakeDamage(ORB_BLAST_DAMAGE)
+						end)
+						pcall(function()
+							desc.Health = 0
+						end)
+					end
+				end
+			end
+		end
+	end
+end
+
+local function forceKillHumanoid(hum)
+	if not hum or hum.Health <= 0 then
+		return
+	end
+
+	pcall(function()
+		hum.Health = 0
+	end)
+	task.wait(0.03)
+
+	if hum.Parent and hum.Health > 0 then
+		local maxHealth = hum.MaxHealth > 0 and hum.MaxHealth or 100
+		pcall(function()
+			hum.Health = math.min(100, maxHealth)
+		end)
+		task.wait(0.03)
+	end
+
+	if hum.Parent and hum.Health > 0 then
+		pcall(function()
+			hum.Health = 0
+		end)
+		task.wait(0.03)
+	end
+
+	if hum.Parent and hum.Health > 0 then
+		pcall(function()
+			hum:TakeDamage(9e37)
+		end)
+		task.wait(0.03)
+	end
+
+	if hum.Parent and hum.Health > 0 then
+		pcall(function()
+			hum.Health = 0
+		end)
+	end
+end
+
+local function groupAliveCount(cluster)
+	local alive = 0
+	for _, model in ipairs(cluster) do
+		if model and model.Parent then
+			local hum = model:FindFirstChildOfClass("Humanoid")
+			if hum and hum.Health > 0 then
+				alive += 1
+			end
+		end
+	end
+	return alive
+end
+
+local function killClusterUntilDead(cluster)
+	local startClock = os.clock()
+
+	while true do
+		local alive = groupAliveCount(cluster)
+		if alive <= 0 then
+			return
+		end
+
+		local centroid = Vector3.new(0, 0, 0)
+		local count = 0
+		for _, model in ipairs(cluster) do
+			if model and model.Parent then
+				local root = getRootPart(model)
+				if root then
+					centroid += root.Position
+					count += 1
+				end
+			end
+		end
+		if count > 0 then
+			centroid /= count
+		else
+			centroid = (getHRP() and getHRP().Position) or Vector3.new(0, 0, 0)
+		end
+
+		local localRoot = getHRP()
+		local localPlayerClosest = getPlayerClosestToPoint(centroid)
+
+		-- If another player is currently closer to the NPC group, move the local player there first.
+		if localRoot and localPlayerClosest ~= localPlayer then
+			pcall(function()
+				localRoot.CFrame = CFrame.new(centroid + Vector3.new(0, 6, 0))
+			end)
+			task.wait(0.08)
+		end
+
+		-- Re-check after teleport and keep focusing this group until every NPC is dead.
+		for _, model in ipairs(cluster) do
+			if model and model.Parent then
+				local hum = model:FindFirstChildOfClass("Humanoid")
+				local root = getRootPart(model)
+				if hum and root and hum.Health > 0 then
+					pcall(function()
+						root.AssemblyLinearVelocity = Vector3.new(0, 130, 0)
+						root.AssemblyAngularVelocity = Vector3.new(math.random(-15, 15), math.random(-15, 15), math.random(-15, 15))
+					end)
+					forceKillHumanoid(hum)
+				end
+			end
+		end
+
+		task.wait(0.08)
+
+		-- Keep repeating until the whole group is properly dead.
+		if os.clock() - startClock > 120 then
+			-- hard safety stop against infinite lockup if a model is unkillable
+			return
+		end
+	end
+end
+
+local function finalizeRelease(snapshotModels)
+	releasing = true
+	updateUI()
+
+	-- Keep the hold sphere active until every captured NPC is dead.
+	local releaseClusters = clusterNPCs(snapshotModels, 36)
+
+	for _, cluster in ipairs(releaseClusters) do
+		killClusterUntilDead(cluster)
+	end
+
+	restoreTrackedSpeeds()
+	clearCaughtHighlights()
+	fadeAndDestroyHoldVisual()
+
+	releasing = false
+	updateUI()
+
+	local returnHRP = getHRP()
+	if returnHRP and holdStartCFrame then
+		pcall(function()
+			returnHRP.CFrame = holdStartCFrame
+		end)
+	end
+end
+
+local function createHoldGui()
+	if gui then
+		return
+	end
+
+	gui = Instance.new("ScreenGui")
+	gui.Name = "MyWorldGui"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = false
+	gui.Parent = localPlayer:WaitForChild("PlayerGui")
+
+	topLabel = Instance.new("TextLabel")
+	topLabel.Name = "TopLabel"
+	topLabel.AnchorPoint = Vector2.new(0.5, 0)
+	topLabel.Position = UDim2.new(0.5, 0, 0, 8)
+	topLabel.Size = UDim2.new(0, 360, 0, 24)
+	topLabel.BackgroundTransparency = 1
+	topLabel.TextColor3 = Color3.new(1, 1, 1)
+	topLabel.TextStrokeTransparency = 0.3
+	topLabel.Font = Enum.Font.SourceSansBold
+	topLabel.TextSize = 18
+	topLabel.Visible = false
+	topLabel.Parent = gui
+
+	countLabel = Instance.new("TextLabel")
+	countLabel.Name = "CountLabel"
+	countLabel.AnchorPoint = Vector2.new(0.5, 0)
+	countLabel.Position = UDim2.new(0.5, 0, 0, 32)
+	countLabel.Size = UDim2.new(0, 360, 0, 20)
+	countLabel.BackgroundTransparency = 1
+	countLabel.TextColor3 = Color3.new(1, 1, 1)
+	countLabel.TextStrokeTransparency = 0.3
+	countLabel.Font = Enum.Font.SourceSans
+	countLabel.TextSize = 16
+	countLabel.Visible = false
+	countLabel.Parent = gui
+
+	topBar = Instance.new("Frame")
+	topBar.Name = "ToolBar"
+	topBar.AnchorPoint = Vector2.new(0.5, 1)
+	topBar.Position = UDim2.new(0.5, 0, 1, -12)
+	topBar.Size = UDim2.new(0, 300, 0, 40)
+	topBar.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+	topBar.BackgroundTransparency = 0.2
+	topBar.BorderSizePixel = 0
+	topBar.Visible = false
+	topBar.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = topBar
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = 1
+	stroke.Transparency = 0.7
+	stroke.Color = Color3.fromRGB(255, 255, 255)
+	stroke.Parent = topBar
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, 5)
+	padding.PaddingBottom = UDim.new(0, 5)
+	padding.PaddingLeft = UDim.new(0, 6)
+	padding.PaddingRight = UDim.new(0, 6)
+	padding.Parent = topBar
+
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Horizontal
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Padding = UDim.new(0, 6)
+	layout.Parent = topBar
+
+	uiScale = Instance.new("UIScale")
+	uiScale.Parent = topBar
+
+	shootButton = Instance.new("TextButton")
+	shootButton.Name = "ShootOrbButton"
+	shootButton.LayoutOrder = 1
+	shootButton.Size = UDim2.new(0.32, 0, 1, 0)
+	shootButton.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+	shootButton.BorderSizePixel = 0
+	shootButton.TextColor3 = Color3.new(1, 1, 1)
+	shootButton.Font = Enum.Font.SourceSansBold
+	shootButton.TextSize = 16
+	shootButton.Text = "Shoot Orb"
+	shootButton.Parent = topBar
+
+	local shootCorner = Instance.new("UICorner")
+	shootCorner.CornerRadius = UDim.new(0, 6)
+	shootCorner.Parent = shootButton
+
+	holdButton = Instance.new("TextButton")
+	holdButton.Name = "HoldButton"
+	holdButton.LayoutOrder = 2
+	holdButton.Size = UDim2.new(0.68, 0, 1, 0)
+	holdButton.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+	holdButton.BorderSizePixel = 0
+	holdButton.TextColor3 = Color3.new(1, 1, 1)
+	holdButton.Font = Enum.Font.SourceSansBold
+	holdButton.TextSize = 16
+	holdButton.Text = "Hold"
+	holdButton.Parent = topBar
+
+	local holdCorner = Instance.new("UICorner")
+	holdCorner.CornerRadius = UDim.new(0, 6)
+	holdCorner.Parent = holdButton
+
+	shootButton.Activated:Connect(function()
+		if equipped and not holding and not releasing then
+			orbBlast()
+		end
+	end)
+
+	holdButton.InputBegan:Connect(function(input)
+		if not equipped or releasing then
+			return
+		end
+
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			if holding then
+				return
+			end
+
+			holdSession += 1
+			local session = holdSession
+
+			holding = true
+			holdStartCFrame = getHRP() and getHRP().CFrame or nil
+			holdCenter = getHRP() and getHRP().Position or nil
+			holdRadius = 8
+			currentCaught = {}
+
+			createHoldVisual()
+			updateUI()
+
+			task.spawn(function()
+				local start = os.clock()
+				local lastUpdate = 0
+
+				while holding and holdSession == session do
+					local hrp = getHRP()
+					if not hrp or not hrp.Parent then
+						break
+					end
+
+					local elapsed = os.clock() - start
+					local alpha = math.clamp(elapsed / HOLD_MAX_TIME, 0, 1)
+					local eased = alpha ^ 2.25
+					local radius = math.max(8, HOLD_MAX_RADIUS * eased)
+					local spherePos = hrp.Position
+
+					holdCenter = spherePos
+					holdRadius = radius
+					updateHoldVisual(spherePos, radius)
+
+					if elapsed - lastUpdate >= HOLD_UPDATE_DT then
+						lastUpdate = elapsed
+
+						local caught = getNPCsWithinRadius(spherePos, radius)
+						local newCaught = {}
+
+						for _, model in ipairs(caught) do
+							newCaught[model] = true
+						end
+
+						currentCaught = newCaught
+
+						for model in pairs(caughtHighlights) do
+							if not newCaught[model] then
+								setCaughtHighlight(model, false)
+							end
+						end
+
+						for model in pairs(newCaught) do
+							setCaughtHighlight(model, true)
+							setNPCSlow(model, spherePos, radius)
+						end
+
+						for hum, original in pairs(trackedWalkSpeeds) do
+							local m = hum and hum.Parent
+							if not m or not newCaught[m] or hum.Health <= 0 then
+								if hum and hum.Parent then
+									pcall(function()
+										hum.WalkSpeed = original
+									end)
+								end
+								trackedWalkSpeeds[hum] = nil
+							end
+						end
+
+						updateHoldOverlay(radius, #caught)
+					end
+
+					RunService.Heartbeat:Wait()
+				end
+			end)
+		end
+	end)
+
+	holdButton.InputEnded:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+		if not holding then
+			return
+		end
+
+		holding = false
+		releasing = true
+		updateUI()
+
+		task.spawn(function()
+			local hrp = getHRP()
+			if not hrp then
+				restoreTrackedSpeeds()
+				clearCaughtHighlights()
+				fadeAndDestroyHoldVisual()
+				releasing = false
+				updateUI()
+				return
+			end
+
+			local snapshotMap = {}
+
+			-- Freeze exactly what was already caught at release time.
+			for model in pairs(currentCaught) do
+				if model and model.Parent then
+					snapshotMap[model] = true
+				end
+			end
+
+			-- Final capture pass so even one NPC is not missed out.
+			local finalCenter = holdCenter or hrp.Position
+			local finalRadius = holdRadius
+			for _, model in ipairs(getNPCsWithinRadius(finalCenter, finalRadius)) do
+				if model and model.Parent then
+					snapshotMap[model] = true
+				end
+			end
+
+			local snapshotModels = {}
+			for model in pairs(snapshotMap) do
+				table.insert(snapshotModels, model)
+			end
+
+			table.sort(snapshotModels, function(a, b)
+				local ar = getRootPart(a)
+				local br = getRootPart(b)
+				local localRoot = getHRP()
+				local p = localRoot and localRoot.Position or Vector3.new(0, 0, 0)
+				local ad = ar and (ar.Position - p).Magnitude or math.huge
+				local bd = br and (br.Position - p).Magnitude or math.huge
+				return ad < bd
+			end)
+
+			finalizeRelease(snapshotModels)
+		end)
+	end)
+
+	updateUI()
+	updateUIScale()
+
+	if Workspace.CurrentCamera then
+		Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateUIScale)
+	end
+end
+
+local function createGuiIfNeeded()
+	if gui and gui.Parent then
+		return
+	end
+	createHoldGui()
+end
+
+local function wireTool(tool)
+	if not tool or not tool:IsA("Tool") then
+		return
+	end
+	if tool:FindFirstChild(TOOL_MARKER) then
+		return
+	end
+
+	local marker = Instance.new("BoolValue")
+	marker.Name = TOOL_MARKER
+	marker.Parent = tool
+
+	tool.Equipped:Connect(function(m)
+		equipped = true
+		mouse = m or localPlayer:GetMouse()
+		createGuiIfNeeded()
+		updateUI()
+	end)
+
+	tool.Unequipped:Connect(function()
+		equipped = false
+		if holding then
+			holding = false
+		end
+		if not releasing then
+			clearCaughtHighlights()
+			restoreTrackedSpeeds()
+			destroyHoldVisual()
+		end
+		updateUI()
+	end)
+
+	tool.Activated:Connect(function()
+		if equipped and not holding and not releasing then
+			orbBlast()
+		end
+	end)
+end
+
+local function ensureOnRespawn()
+	task.wait(0.1)
+	local tool = ensureTool()
+	if tool then
+		toolInstance = tool
+		wireTool(tool)
+	end
+end
+
+toolInstance = ensureTool()
+if toolInstance then
+	wireTool(toolInstance)
+end
+
+localPlayer.CharacterAdded:Connect(function()
+	ensureOnRespawn()
+end)
+
+task.spawn(function()
+	while true do
+		local tool = ensureTool()
+		if tool and tool ~= toolInstance then
+			toolInstance = tool
+			wireTool(tool)
+		end
+		task.wait(1)
+	end
+end)
+
+print("My World loaded for", localPlayer.Name)
